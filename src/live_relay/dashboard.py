@@ -1135,14 +1135,45 @@ class DashboardController:
                 active_platforms=[],
                 destination_errors={},
             )
+        else:
+            # Clean end (the user stopped it, or the source ended): never
+            # leave the dashboard showing a stale "starting"/"stopping" mode.
+            self.status.set_destination_session(None)
+            self.status.update(
+                mode="stopped",
+                message="Relay stopped",
+                started_at=None,
+                active_platforms=[],
+            )
 
-    def stop_relay(self) -> dict[str, Any]:
+    def stop_relay(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Signal the relay to stop and wait until it has torn down.
+
+        The old implementation returned as soon as the stop event was set,
+        so an immediate restart raced with the old thread still holding
+        the encoder and the destinations (and "already running" errors).
+        The join happens outside the controller lock, so a slow teardown
+        can never block a concurrent status/config read. When the thread
+        does not die within ``timeout`` seconds the call still returns,
+        but reports ``stop_timed_out`` so the dashboard can say so
+        instead of pretending the relay is stopped.
+        """
         with self._lock:
             if not self._is_running() or self._stop_event is None:
                 return self.get_status()
+            thread = self._relay_thread
             self.status.update(mode="stopping", message="Stopping relay safely")
             self._stop_event.set()
-            return self.get_status()
+        assert thread is not None
+        thread.join(timeout=timeout)
+        stopped = not thread.is_alive()
+        with self._lock:
+            if stopped:
+                self.status.update(mode="stopped", message="Relay stopped")
+            result = self.get_status()
+        result["stopped"] = stopped
+        result["stop_timed_out"] = not stopped
+        return result
 
     def get_status(self) -> dict[str, Any]:
         data = self.status.snapshot()
@@ -1235,12 +1266,20 @@ def build_handler_class(
                     return
                 self._send(html.encode("utf-8"), "text/html; charset=utf-8")
             elif request_path == "/api/status":
+                if not self._authorized():
+                    return
                 self._json(controller.get_status())
             elif request_path == "/api/config":
+                if not self._authorized():
+                    return
                 self._json(controller.public_config())
             elif request_path == "/api/logs":
+                if not self._authorized():
+                    return
                 self._json({"lines": controller.get_logs()})
             elif request_path == "/api/update":
+                if not self._authorized():
+                    return
                 self._json(controller.update_status())
             elif request_path == "/api/youtube/thumbnail":
                 if not self._authorized():

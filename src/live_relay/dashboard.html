@@ -66,7 +66,7 @@ const modes={idle:"جاهز للإعداد",waiting:"يراقب المصدر",st
 function notice(text,kind=""){const el=$("notice");el.textContent=text;el.className="message "+kind;}
 function modeClass(mode){return mode==="error"?"error":(["waiting","source_offline","reconnecting","starting","stopping","partial"].includes(mode)?"warn":"");}
 function fmtTime(seconds){seconds=Math.max(0,Number(seconds)||0);const h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=seconds%60;return h?`${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`:`${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;}
-async function api(path,method="GET",data){const options={method,headers:{}};if(method==="POST"){options.headers["Content-Type"]="application/json";options.headers["X-Relay-Token"]=CONTROL_TOKEN;options.body=JSON.stringify(data||{});}const response=await fetch(path,options);let result={};try{result=await response.json();}catch{}if(!response.ok)throw new Error(result.error||`Request failed (${response.status})`);return result;}
+async function api(path,method="GET",data){const options={method,headers:{"X-Relay-Token":CONTROL_TOKEN}};if(method==="POST"){options.headers["Content-Type"]="application/json";options.body=JSON.stringify(data||{});}const response=await fetch(path,options);let result={};try{result=await response.json();}catch{}if(!response.ok)throw new Error(result.error||`Request failed (${response.status})`);return result;}
 function setState(data){
 status=data;
 const mode=data.mode||"idle";

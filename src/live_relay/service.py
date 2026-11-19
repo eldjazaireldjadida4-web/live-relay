@@ -640,7 +640,14 @@ def _start_encoder(
 
 
 def _session_is_dead(session: DestinationSession) -> bool:
-    """True when the platform event itself ended and must be re-created."""
+    """True when the platform event itself ended and must be re-created.
+
+    A YouTube broadcast in state "created" is NOT dead: it has never gone
+    live yet, and YouTube moves it to "live" as soon as the encoder
+    connects. Discarding it here would mint a brand-new event (and a new
+    watch URL) on every gave-up retry instead of resuming the same one.
+    Only "complete" (ended) and "revoked" (withdrawn) can never go live.
+    """
     if session.youtube:
         try:
             state = session.youtube.check_status()
@@ -649,7 +656,7 @@ def _session_is_dead(session: DestinationSession) -> bool:
                 "YouTube session check failed: %s", redact_urls(str(exc))[:200]
             )
             return False
-        return state.get("broadcast_status") in {"complete", "revoked", "created"}
+        return state.get("broadcast_status") in {"complete", "revoked"}
     return False
 
 

@@ -19,14 +19,18 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -x .venv/bin/python ]; then
-  python3 -m venv .venv
-fi
+ensure_dependencies() {
+  if [ ! -x .venv/bin/python ]; then
+    python3 -m venv .venv
+  fi
 
-if ! ".venv/bin/python" -c "import live_relay, yt_dlp, curl_cffi, imageio_ffmpeg, dotenv, requests, googleapiclient, google_auth_oauthlib; raise SystemExit(tuple(map(int, yt_dlp.version.__version__.split('.')[:3])) < (2026, 10, 21))" >/dev/null 2>&1; then
-  echo "Installing project dependencies for the first time or repairing the environment..."
-  ".venv/bin/python" -m pip install --disable-pip-version-check -e .
-fi
+  if ! ".venv/bin/python" -c "import live_relay, yt_dlp, curl_cffi, imageio_ffmpeg, dotenv, requests, googleapiclient, google_auth_oauthlib; raise SystemExit(tuple(map(int, yt_dlp.version.__version__.split('.')[:3])) < (2026, 10, 21))" >/dev/null 2>&1; then
+    echo "Installing project dependencies for the first time or repairing the environment..."
+    ".venv/bin/python" -m pip install --disable-pip-version-check -e .
+  fi
+}
+
+ensure_dependencies
 
 # Exit code 42 means the dashboard staged an update: apply it once, then
 # start the new version. Any other exit code ends the launcher as before.
@@ -42,5 +46,10 @@ for _attempt in 1 2; do
     exit "$code"
   fi
   echo "Installing the staged update, then restarting..."
-  ".venv/bin/python" -m live_relay.updater --apply --project-root "$PWD" || echo "The update could not be applied; starting the current version instead."
+  if ".venv/bin/python" -m live_relay.updater --apply --project-root "$PWD"; then
+    # A new version may bring new dependencies; re-check before relaunch.
+    ensure_dependencies
+  else
+    echo "The update could not be applied; starting the current version instead."
+  fi
 done

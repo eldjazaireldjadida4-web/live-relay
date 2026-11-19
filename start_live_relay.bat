@@ -33,6 +33,33 @@ if not exist ".venv\Scripts\python.exe" (
   )
 )
 
+call :ensure_dependencies
+if errorlevel 1 exit /b 1
+
+REM Exit code 42 means the dashboard staged an update: apply it once, then
+REM start the new version. Loop twice like the shell launcher, so a second
+REM staged update does not silently leave the dashboard down.
+for /l %%A in (1,1,2) do (
+  ".venv\Scripts\python.exe" -m live_relay
+  if not errorlevel 42 (
+    if errorlevel 1 echo The dashboard stopped with an error. Check live-relay.log in your Windows user configuration folder.
+    goto :end
+  )
+  echo Installing the staged update, then restarting...
+  ".venv\Scripts\python.exe" -m live_relay.updater --apply --project-root "%CD%"
+  if errorlevel 1 (
+    echo The update could not be applied; starting the current version instead.
+  ) else (
+    REM A new version may bring new dependencies; re-check before relaunch.
+    call :ensure_dependencies
+    if errorlevel 1 exit /b 1
+  )
+)
+:end
+pause
+exit /b 0
+
+:ensure_dependencies
 ".venv\Scripts\python.exe" -c "import live_relay, yt_dlp, curl_cffi, imageio_ffmpeg, dotenv, requests, googleapiclient, google_auth_oauthlib; raise SystemExit(tuple(map(int, yt_dlp.version.__version__.split('.')[:3])) < (2026, 10, 21))" >nul 2>nul
 if errorlevel 1 (
   echo Installing project dependencies for the first time or repairing the environment...
@@ -43,15 +70,4 @@ if errorlevel 1 (
     exit /b 1
   )
 )
-
-REM Exit code 42 means the dashboard staged an update: apply it once, then
-REM start the new version.
-".venv\Scripts\python.exe" -m live_relay
-if %errorlevel% equ 42 (
-  echo Installing the staged update, then restarting...
-  ".venv\Scripts\python.exe" -m live_relay.updater --apply --project-root "%CD%"
-  if errorlevel 1 echo The update could not be applied; starting the current version instead.
-  ".venv\Scripts\python.exe" -m live_relay
-)
-if errorlevel 1 echo The dashboard stopped with an error. Check live-relay.log in your Windows user configuration folder.
-pause
+exit /b 0

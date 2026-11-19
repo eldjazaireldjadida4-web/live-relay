@@ -346,6 +346,26 @@ class DashboardController:
             and (frame_file.suffix.lower() != ".png" or not frame_file.is_file())
         ):
             missing.append("FRAME_FILE must point to an existing PNG image.")
+        # The logo numbers come from the raw .env and may be hand-edited
+        # garbage (``LOGO_SIZE_PERCENT=abc``) or a non-JSON value such as
+        # ``nan``. Never let one bad value break the whole config response:
+        # fall back to the defaults and say so in ``missing``.
+        try:
+            logo_size_percent = int(values.get("LOGO_SIZE_PERCENT", "12"))
+        except (TypeError, ValueError):
+            logo_size_percent = 12
+            missing.append("LOGO_SIZE_PERCENT is not a number; using 12%.")
+        if not 5 <= logo_size_percent <= 25:
+            missing.append("LOGO_SIZE_PERCENT must be between 5 and 25; using 12%.")
+            logo_size_percent = 12
+        try:
+            logo_opacity = float(values.get("LOGO_OPACITY", "0.9"))
+        except (TypeError, ValueError):
+            logo_opacity = 0.9
+            missing.append("LOGO_OPACITY is not a number; using 0.9.")
+        if logo_opacity != logo_opacity or not 0.1 <= logo_opacity <= 1:
+            missing.append("LOGO_OPACITY must be between 0.1 and 1; using 0.9.")
+            logo_opacity = 0.9
         config = {
             "source_url": values.get("SOURCE_URL", _default_value("SOURCE_URL")),
             "source_platform": values.get("SOURCE_PLATFORM", "auto"),
@@ -386,8 +406,8 @@ class DashboardController:
             "logo_enabled": logo_enabled,
             "logo_file": str(logo_file),
             "logo_position": values.get("LOGO_POSITION", "bottom-right"),
-            "logo_size_percent": int(values.get("LOGO_SIZE_PERCENT", "12")),
-            "logo_opacity": float(values.get("LOGO_OPACITY", "0.9")),
+            "logo_size_percent": logo_size_percent,
+            "logo_opacity": logo_opacity,
             "frame_enabled": frame_enabled,
             "frame_file": str(frame_file) if frame_file else "",
             "facebook_token_set": bool(values.get("FACEBOOK_ACCESS_TOKEN", "").strip()),
@@ -526,7 +546,15 @@ class DashboardController:
                 raise ValueError(
                     "Choose Arabic, English, French, Spanish, or automatic"
                 )
-            for key in ("GEMINI_METADATA_ENABLED", "LOGO_ENABLED", "FRAME_ENABLED"):
+            for key in (
+                "GEMINI_METADATA_ENABLED",
+                "LOGO_ENABLED",
+                "FRAME_ENABLED",
+                "ADAPTIVE_QUALITY",
+                "PIPE_MODE",
+                "YOUTUBE_BACKUP",
+                "CHECK_FOR_UPDATES",
+            ):
                 if key in updates and updates[key].lower() not in {
                     "1",
                     "true",
@@ -616,6 +644,50 @@ class DashboardController:
                 and not Path(client_path).expanduser().is_file()
             ):
                 raise ValueError("The selected Google OAuth JSON file does not exist")
+            # Mirror the load_settings() rules here, so a save that looks
+            # successful can never produce settings that refuse to start.
+            cookie_file = updates.get(
+                "YTDLP_COOKIE_FILE",
+                current_values.get("YTDLP_COOKIE_FILE", ""),
+            ).strip()
+            cookies_browser = updates.get(
+                "YTDLP_COOKIES_FROM_BROWSER",
+                current_values.get("YTDLP_COOKIES_FROM_BROWSER", ""),
+            ).strip()
+            if cookie_file and cookies_browser:
+                raise ValueError(
+                    "Use YTDLP_COOKIE_FILE or YTDLP_COOKIES_FROM_BROWSER, not both"
+                )
+            # Secrets reach ``updates`` only in the loop below, so read a
+            # newly typed token from the request itself, else the saved one.
+            facebook_token = (
+                str(data.get("FACEBOOK_ACCESS_TOKEN", "")).strip()
+                or current_values.get("FACEBOOK_ACCESS_TOKEN", "").strip()
+            )
+            facebook_target = updates.get(
+                "FACEBOOK_TARGET_ID",
+                current_values.get("FACEBOOK_TARGET_ID", "me"),
+            ).strip()
+            if facebook_token and not (
+                facebook_target == "me"
+                or re.fullmatch(r"[0-9]{6,30}", facebook_target)
+            ):
+                raise ValueError(
+                    "FACEBOOK_TARGET_ID must be 'me' or a numeric Facebook "
+                    "Page/Profile ID"
+                )
+            logo_enabled = _as_bool(
+                updates.get(
+                    "LOGO_ENABLED",
+                    current_values.get("LOGO_ENABLED", "true"),
+                )
+            )
+            logo_file_value = updates.get(
+                "LOGO_FILE", current_values.get("LOGO_FILE", "")
+            ).strip()
+            if logo_enabled and logo_file_value:
+                if not resolve_project_path(logo_file_value).is_file():
+                    raise ValueError("LOGO_FILE must point to an existing image")
             for key in SECRET_KEYS:
                 if key in data:
                     value = str(data[key]).strip()
@@ -1007,6 +1079,11 @@ class DashboardController:
             if not force and not updater.due_for_check(state_dir):
                 return {**status, "checked": False, "reason": "throttled"}
             release = updater.fetch_latest_release(status["repo"])
+            if release is None:
+                # A failed check must not wipe the previously known latest
+                # release, and must not consume the day's throttle: the
+                # update stays visible and the next check is not delayed.
+                return {**status, "checked": False, "reason": "fetch_failed"}
             updater.write_update_state(
                 state_dir, last_check=time.time(), latest=release
             )
@@ -1250,6 +1327,16 @@ def build_handler_class(
             return True
 
         def do_GET(self) -> None:
+            try:
+                self._do_get()
+            except Exception as exc:  # pragma: no cover - safety net
+                logging.exception("Dashboard GET request failed: %s", exc)
+                try:
+                    self._json({"error": "The dashboard could not answer."}, 500)
+                except Exception:
+                    pass
+
+        def _do_get(self) -> None:
             if not self._host_is_local():
                 self._json(
                     {"error": "The dashboard only accepts local connections."}, 403

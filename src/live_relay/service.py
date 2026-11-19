@@ -309,7 +309,14 @@ def _start_worker(
     portrait = getattr(source, "width", 0) > 0 and getattr(
         source, "height", 0
     ) > getattr(source, "width", 0)
-    logo_path, frame_path = _branding_inputs(settings, portrait)
+    try:
+        logo_path, frame_path = _branding_inputs(settings, portrait)
+    except ValueError as exc:
+        # A branding file deleted mid-run (or a bad encoder setting) must
+        # fail this worker like any other worker failure, not kill the
+        # whole relay by propagating out of _start_encoder/run().
+        logging.warning("Worker %s cannot start: %s", worker.name, exc)
+        return False
     recording_path = ""
     if settings.record_enabled and worker.index == 0:
         try:
@@ -317,22 +324,26 @@ def _start_worker(
             logging.info("Archiving this session to %s", recording_path)
         except OSError as exc:
             logging.warning("Recording disabled for this session: %s", exc)
-    commands = build_commands(
-        ffmpeg,
-        source.urls,
-        [session.targets[worker.index]],
-        quality.profile,
-        source.headers,
-        pipe_mode=settings.pipe_mode,
-        preset=settings.ffmpeg_preset,
-        logo_path=logo_path,
-        logo_position=getattr(settings, "logo_position", "bottom-right"),
-        logo_size_percent=getattr(settings, "logo_size_percent", 12),
-        logo_opacity=getattr(settings, "logo_opacity", 0.9),
-        portrait=portrait,
-        frame_path=frame_path,
-        recording_path=recording_path,
-    )
+    try:
+        commands = build_commands(
+            ffmpeg,
+            source.urls,
+            [session.targets[worker.index]],
+            quality.profile,
+            source.headers,
+            pipe_mode=settings.pipe_mode,
+            preset=settings.ffmpeg_preset,
+            logo_path=logo_path,
+            logo_position=getattr(settings, "logo_position", "bottom-right"),
+            logo_size_percent=getattr(settings, "logo_size_percent", 12),
+            logo_opacity=getattr(settings, "logo_opacity", 0.9),
+            portrait=portrait,
+            frame_path=frame_path,
+            recording_path=recording_path,
+        )
+    except ValueError as exc:
+        logging.warning("Worker %s cannot start: %s", worker.name, exc)
+        return False
     pipe_process: subprocess.Popen[str] | None = None
     input_stream: Any = subprocess.DEVNULL
     if settings.pipe_mode:
@@ -584,7 +595,16 @@ def _start_encoder(
                             and youtube_status["stream_status"] == "active"
                         ):
                             session.youtube.ensure_live()
-                        starved = youtube_status["stream_health"] == "no_data"
+                        # Starvation is judged by the stream status, not the
+                        # health status: ``active`` means YouTube is receiving
+                        # data, while ``inactive``/``error`` means it is not.
+                        # ``noData`` health only means YouTube has no health
+                        # information about the stream, so it is neither
+                        # healthy nor starved on its own.
+                        starved = youtube_status["stream_status"] in {
+                            "inactive",
+                            "error",
+                        }
                     except Exception as exc:
                         logging.warning(
                             "YouTube status check failed: %s",

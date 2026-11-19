@@ -9,7 +9,9 @@ from typing import Any
 
 from .config import ensure_private_dir
 
-MAX_THUMBNAIL_SIZE = 50_000_000
+# YouTube rejects thumbnails larger than 2 MB; anything bigger would be
+# accepted by the dashboard and then fail on every broadcast forever.
+MAX_THUMBNAIL_SIZE = 2_000_000
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 JPEG_SOF_MARKERS = {
     0xC0,
@@ -32,7 +34,7 @@ def inspect_thumbnail(data: bytes) -> dict[str, Any]:
     if not data:
         raise ValueError("Choose a non-empty PNG or JPEG image")
     if len(data) > MAX_THUMBNAIL_SIZE:
-        raise ValueError("The thumbnail must be 50 MB or smaller")
+        raise ValueError("The thumbnail must be 2 MB or smaller (YouTube's limit)")
     if data.startswith(PNG_SIGNATURE):
         if (
             len(data) < 33

@@ -13,7 +13,10 @@ Safety rules, all deliberate:
 - Nothing is downloaded or applied without an explicit user click in the
   dashboard. The automatic check only *reports* that a release exists.
 - A staged zip is verified before it is trusted: ``PK`` magic, announced
-  size when GitHub gives one, and :func:`zipfile.ZipFile.testzip`.
+  size when GitHub gives one, and :func:`zipfile.ZipFile.testzip` at
+  download; its size and sha256 are recorded at staging and re-checked at
+  apply time, and the extracted tree must prove it is live-relay at the
+  staged version before any file is touched.
 - Applying an update never touches local secrets or local state: ``.env``,
   ``.venv``, OAuth/client-secret files, TLS keys, logs and the state
   directory are preserved, and zip members escaping the project root
@@ -25,11 +28,13 @@ Safety rules, all deliberate:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -45,10 +50,13 @@ UPDATE_RESTART_EXIT_CODE = 42
 CHECK_INTERVAL_SECONDS = 86400  # check at most once a day
 CHECK_TIMEOUT_SECONDS = 10
 DOWNLOAD_TIMEOUT_SECONDS = 120
+DOWNLOAD_MAX_BYTES = 200 * 1024 * 1024
 MAX_RELEASE_NOTES_CHARS = 4000
 
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_VERSION_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+_VERSION_PATTERN = re.compile(
+    r"^v?(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?(?:[-+].*)?$"
+)
 
 # Paths that an update must never overwrite, relative to the project root.
 _PRESERVED_NAMES = {".env", ".git", ".venv", ".test-venv", "__pycache__"}
@@ -56,14 +64,17 @@ _PRESERVED_SUFFIXES = (".key", ".crt", ".pem", ".p12", ".log")
 _PRESERVED_PREFIXES = ("client_secret", "oauth-client")
 
 
-def parse_version(value: str) -> tuple[int, int, int] | None:
-    """Parse ``4.8.2`` or ``v4.8.2``; anything else is not a release version."""
+def parse_version(value: str) -> tuple[int, ...] | None:
+    """Parse ``4.8.2``, ``v4.8.2``, a four-part hotfix ``4.8.3.1`` or a
+    pre-release tag such as ``v4.8.3-rc1`` (the numeric core is used, so a
+    pre-release compares equal to its release). Anything else is not a
+    release version."""
     if not isinstance(value, str):
         return None
     match = _VERSION_PATTERN.match(value.strip())
     if not match:
         return None
-    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+    return tuple(int(part) for part in match.groups() if part is not None)
 
 
 def is_newer(latest: str, current: str) -> bool:
@@ -137,8 +148,9 @@ def download_release_zip(
 ) -> Path:
     """Download ``url`` to ``destination`` and verify it is a usable zip.
 
-    Raises :class:`ValueError` on a size mismatch, a non-zip payload or a
-    corrupt zip, and removes the partial file on any failure.
+    Raises :class:`ValueError` on a size mismatch, an oversized download, a
+    non-zip payload or a corrupt zip, and removes the partial file on any
+    failure.
     """
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -158,26 +170,42 @@ def download_release_zip(
                     if not chunk:
                         break
                     total += len(chunk)
+                    if total > DOWNLOAD_MAX_BYTES:
+                        raise ValueError(
+                            "Downloaded update exceeds the "
+                            f"{DOWNLOAD_MAX_BYTES // (1024 * 1024)} MB limit"
+                        )
                     handle.write(chunk)
     except (URLError, HTTPError, OSError, TimeoutError) as exc:
         _remove_quietly(destination)
         raise RuntimeError(f"Could not download the update: {type(exc).__name__}") from exc
+    except ValueError:
+        _remove_quietly(destination)
+        raise
     if expected_size is not None and total != expected_size:
         _remove_quietly(destination)
         raise ValueError(
             f"Downloaded update size {total} does not match the announced "
             f"size {expected_size}; the partial file was removed"
         )
-    if destination.stat().st_size < 2 or destination.read_bytes()[:2] != b"PK":
+    try:
+        with open(destination, "rb") as handle:
+            magic = handle.read(2)
+    except OSError:
+        _remove_quietly(destination)
+        raise ValueError("Downloaded update could not be read") from None
+    if len(magic) < 2 or magic != b"PK":
         _remove_quietly(destination)
         raise ValueError("Downloaded update is not a zip file")
     try:
         with zipfile.ZipFile(destination) as archive:
-            if archive.testzip() is not None:
-                raise ValueError("Downloaded update zip is corrupt")
+            corrupt_member = archive.testzip()
     except zipfile.BadZipFile as exc:
         _remove_quietly(destination)
         raise ValueError("Downloaded update is not a valid zip file") from exc
+    if corrupt_member is not None:
+        _remove_quietly(destination)
+        raise ValueError("Downloaded update zip is corrupt")
     return destination
 
 
@@ -204,9 +232,23 @@ def _write_state_file(state_dir: Path, state: dict) -> None:
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     path = _update_state_path(state_dir)
-    path.write_text(json.dumps(state), encoding="utf-8")
+    fd, temp_name = tempfile.mkstemp(prefix=".update-", dir=state_dir)
     try:
-        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+    except BaseException:
+        _remove_quietly(Path(temp_name))
+        raise
+    try:
+        dir_fd = os.open(state_dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except OSError:
         pass
 
@@ -227,15 +269,39 @@ def due_for_check(state_dir: Path, now: float | None = None) -> bool:
     return (now if now is not None else time.time()) - last >= CHECK_INTERVAL_SECONDS
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def stage_update(state_dir: Path, release: dict, zip_path: Path) -> dict:
-    """Record a verified downloaded release as staged for the next start."""
+    """Record a verified downloaded release as staged for the next start.
+
+    The zip's size and sha256 are stored with the marker so
+    :func:`apply_pending_update` can prove the staged file is the one that
+    was downloaded, not a damaged or swapped copy. When the file cannot be
+    read (a mocked download in tests), the marker is stored without them
+    and apply falls back to zip-integrity checks.
+    """
+    zip_path = Path(zip_path)
+    try:
+        size = zip_path.stat().st_size
+        sha256 = _file_sha256(zip_path)
+    except OSError:
+        size = None
+        sha256 = None
     return write_update_state(
         state_dir,
         staged={
             "version": release["version"],
             "tag": release.get("tag", ""),
             "html_url": release.get("html_url", ""),
-            "zip": str(Path(zip_path)),
+            "zip": str(zip_path),
+            "size": size,
+            "sha256": sha256,
         },
     )
 
@@ -277,12 +343,73 @@ def _top_level_prefix(members: list[zipfile.ZipInfo]) -> str:
     return ""
 
 
+def _copy_file_atomic(source: Path, target: Path) -> None:
+    """Copy ``source`` over ``target`` atomically, preserving its mode.
+
+    The bytes land in a temporary file in the target directory and are
+    moved into place with :func:`os.replace`, so a crash mid-copy can never
+    leave a half-written file behind, and executable bits (launcher
+    scripts) survive the update.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".update-", dir=target.parent)
+    temp_path = Path(temp_name)
+    try:
+        with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        shutil.copymode(source, temp_path)
+        os.replace(temp_path, target)
+    except BaseException:
+        _remove_quietly(temp_path)
+        raise
+    try:
+        dir_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def _validate_update_content(content_root: Path, version: str) -> None:
+    """Prove the extracted tree really is live-relay at ``version``.
+
+    Raises :class:`ValueError` for an empty zip, a zip of unrelated files,
+    a mixed layout, or a version mismatch. Nothing is copied before this
+    passes, so a bad zip can never report a successful update.
+    """
+    package_init = content_root / "src" / "live_relay" / "__init__.py"
+    if not package_init.is_file():
+        raise ValueError(
+            "Update zip does not contain the live-relay project "
+            "(missing src/live_relay/__init__.py)"
+        )
+    text = package_init.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"""__version__\s*=\s*["']([^"']+)["']""", text)
+    if not match:
+        raise ValueError("Update zip has no readable __version__")
+    extracted_version = parse_version(match.group(1))
+    staged_version = parse_version(version)
+    if extracted_version is None or staged_version is None:
+        raise ValueError("Update zip version could not be parsed")
+    if extracted_version != staged_version:
+        raise ValueError(
+            f"Update zip is version {match.group(1)}, not the staged {version}"
+        )
+
+
 def apply_pending_update(project_root: Path, state_dir: Path) -> str | None:
     """Apply a staged update over ``project_root``; return its version.
 
     Returns ``None`` when nothing is staged. Preserved files (``.env``,
     ``.venv``, secrets, logs, the state directory) are never overwritten.
     The staged marker and zip are removed only after a successful apply.
+    The staged zip is re-verified (size and sha256 when they were recorded,
+    otherwise zip integrity) and the extracted tree must prove it is
+    live-relay at the staged version before any file is touched.
     """
     project_root = Path(project_root).resolve()
     state_dir = Path(state_dir)
@@ -296,13 +423,53 @@ def apply_pending_update(project_root: Path, state_dir: Path) -> str | None:
         raise RuntimeError("Staged update file is missing; download it again")
     if not version or parse_version(version) is None:
         raise ValueError("Staged update has no valid version")
+    expected_size = staged.get("size")
+    expected_sha256 = staged.get("sha256")
+    if isinstance(expected_size, int) and zip_path.stat().st_size != expected_size:
+        raise ValueError("Staged update file changed size; download it again")
+    if isinstance(expected_sha256, str) and _file_sha256(zip_path) != expected_sha256:
+        raise ValueError("Staged update file is damaged; download it again")
     with zipfile.ZipFile(zip_path) as archive:
         members = _safe_members(archive)
         prefix = _top_level_prefix(members)
+        if archive.testzip() is not None:
+            raise ValueError("Staged update zip is corrupt")
+        # The zip records Unix modes in external_attr, but extraction does
+        # not restore them; remember the executable bits so launcher
+        # scripts keep working after the update.
+        zip_modes = {
+            info.filename: (info.external_attr >> 16) & 0o777
+            for info in archive.infolist()
+            if not info.is_dir()
+        }
         with tempfile.TemporaryDirectory(prefix="live-relay-update-") as directory:
             extracted = Path(directory)
             archive.extractall(extracted)
-            content_root = extracted / prefix.rstrip("/") if prefix else extracted
+            # A GitHub zipball has everything under one ``repo-tag/``
+            # directory, which is stripped. But a plain project zip whose
+            # files happen to share one first directory (for example only
+            # ``src/...`` files) would be mis-detected, so fall back to
+            # the unstripped tree when the stripped one is not the project.
+            candidates = []
+            if prefix:
+                candidates.append(extracted / prefix.rstrip("/"))
+            candidates.append(extracted)
+            content_root = None
+            first_error: ValueError | None = None
+            for candidate in candidates:
+                try:
+                    _validate_update_content(candidate, version)
+                except ValueError as exc:
+                    # Keep the first failure: for a real zipball it names
+                    # the actual problem (e.g. a version mismatch), while
+                    # the fallback candidate is expected to fail.
+                    if first_error is None:
+                        first_error = exc
+                    continue
+                content_root = candidate
+                break
+            if content_root is None:
+                raise first_error  # type: ignore[misc]
             for source in sorted(content_root.rglob("*")):
                 if not source.is_file():
                     continue
@@ -316,8 +483,15 @@ def apply_pending_update(project_root: Path, state_dir: Path) -> str | None:
                     continue
                 except ValueError:
                     pass
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, target)
+                _copy_file_atomic(source, target)
+                member = f"{prefix}{relative.as_posix()}" if prefix else relative.as_posix()
+                recorded = zip_modes.get(member, 0)
+                if recorded & 0o111:
+                    try:
+                        current = stat.S_IMODE(target.stat().st_mode)
+                        os.chmod(target, current | (recorded & 0o111))
+                    except OSError:
+                        pass
     state.pop("staged", None)
     state["last_applied_version"] = version
     state["last_applied_at"] = time.time()

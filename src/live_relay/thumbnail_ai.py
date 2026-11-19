@@ -165,6 +165,10 @@ def _composite_with_frame(
 
 
 def _frame_path(settings: Any) -> Path | None:
+    # FRAME_ENABLED=false must actually disable the frame on AI thumbnails,
+    # like it does on the encoder path; otherwise the dashboard toggle lies.
+    if not getattr(settings, "frame_enabled", False):
+        return None
     configured = str(getattr(settings, "frame_file", "") or "").strip()
     if configured and Path(configured).is_file():
         return Path(configured)

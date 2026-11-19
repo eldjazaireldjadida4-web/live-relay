@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
+import httplib2
 import requests
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -22,6 +23,22 @@ from .source import clean_title
 from .thumbnails import get_thumbnail_path
 
 YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
+
+# A hung YouTube API connection must never freeze supervision, startup or
+# shutdown forever: every client gets an explicit HTTP timeout (Facebook
+# already uses timeout=30 on its calls).
+YOUTUBE_HTTP_TIMEOUT_SECONDS = 30
+
+
+def _youtube_service(credentials: Any):
+    """Build a YouTube Data API client with a bounded HTTP timeout."""
+    return build(
+        "youtube",
+        "v3",
+        credentials=credentials,
+        cache_discovery=False,
+        http=httplib2.Http(timeout=YOUTUBE_HTTP_TIMEOUT_SECONDS),
+    )
 
 
 @dataclass
@@ -184,7 +201,7 @@ class YouTubeDestination:
             raise RuntimeError(
                 "YouTube authorization is missing or expired. Reconnect the account from the dashboard before starting."
             )
-        service = build("youtube", "v3", credentials=credentials, cache_discovery=False)
+        service = _youtube_service(credentials)
         channel_ids = {
             item.get("id")
             for item in service.channels()
@@ -205,7 +222,7 @@ class YouTubeDestination:
             raise RuntimeError(
                 "No valid YouTube authorization is saved on this device; press 'ربط YouTube' once before checking."
             )
-        service = build("youtube", "v3", credentials=credentials, cache_discovery=False)
+        service = _youtube_service(credentials)
         items = (
             service.channels()
             .list(part="id,snippet", mine=True)
@@ -337,6 +354,13 @@ class YouTubeDestination:
                 or "unknown"
             ),
         }
+        # YouTube returns the health status in camelCase (good, ok, bad,
+        # noData). Normalise ``noData`` so the consumers can compare against
+        # the snake_case name; ``noData`` means "YouTube has no health
+        # information", not "no data is arriving", so callers must not
+        # treat it as starvation on its own.
+        if result["stream_health"] == "noData":
+            result["stream_health"] = "no_data"
         return result
 
     def ensure_live(self) -> bool:

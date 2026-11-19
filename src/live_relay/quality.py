@@ -36,7 +36,10 @@ class AdaptiveQuality:
     def observe(
         self, speed: float | None, now: float, health: str | None = None
     ) -> str | None:
-        if health in {"bad", "no_data"}:
+        # ``bad`` health means YouTube is receiving degraded data. ``no_data``
+        # (YouTube's ``noData``) means YouTube has no health information at
+        # all, which is neither healthy nor slow, so it does not count here.
+        if health == "bad":
             self.slow_heartbeats += 1
             self.stable_since = None
             if self.slow_heartbeats >= 2:

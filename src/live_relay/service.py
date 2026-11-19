@@ -12,9 +12,11 @@ from typing import Any
 
 from .config import Settings
 from .destinations import (
+    DestinationHealth,
     DestinationSession,
     close_destinations,
     open_destinations,
+    recreate_destination,
     update_destination_metadata,
     update_destination_thumbnail,
 )
@@ -187,10 +189,31 @@ def _update_worker_status(
             if worker.failure_reason
         }
     )
+    cooling = sorted(
+        name
+        for name, health in (
+            getattr(session, "health", None).items()
+            if isinstance(getattr(session, "health", None), dict)
+            else []
+        )
+        if health.breaker_open
+    )
     if active_platforms:
         mode, message = _destination_status(session, active_platforms, failures)
     elif workers and all(worker.exhausted for worker in workers):
-        mode, message = "error", "توقفت جميع الوجهات بعد استنفاد محاولات إعادة الاتصال"
+        if cooling:
+            # Every destination is in a breaker cooldown, not terminally
+            # dead: the next probe is already scheduled.
+            mode, message = (
+                "reconnecting",
+                "كل الوجهات في فترة تهدئة بعد فشل متكرر؛ إعادة المحاولة قريباً: "
+                + "، ".join(cooling),
+            )
+        else:
+            mode, message = (
+                "error",
+                "توقفت جميع الوجهات بعد استنفاد محاولات إعادة الاتصال",
+            )
     elif failures:
         mode, message = _destination_status(session, active_platforms, failures)
     else:
@@ -226,9 +249,165 @@ def _transport_failure_reason(platform: str) -> str:
     return "RTMP(S) connection failed; verify the destination stream key and network"
 
 
-WORKER_MAX_CONSECUTIVE_FAILURES = 5
 WORKER_BACKOFF_CAP = 30.0
 WORKER_STABLE_SECONDS = 120.0
+# Session-level circuit breaker (H7): consecutive failures are counted on
+# the destination, not the worker, so they survive supervision re-entries.
+# After this many consecutive failures a destination cools down instead of
+# retrying forever; the cooldown doubles on every trip, up to the cap.
+DESTINATION_MAX_CONSECUTIVE_FAILURES = 5
+DESTINATION_BREAKER_BASE_COOLDOWN = 60.0
+DESTINATION_BREAKER_MAX_COOLDOWN = 600.0
+
+
+def _breaker_cooldown(trips: int) -> float:
+    return min(
+        DESTINATION_BREAKER_MAX_COOLDOWN,
+        DESTINATION_BREAKER_BASE_COOLDOWN * (2 ** max(0, trips - 1)),
+    )
+
+
+def _destination_health(
+    session: DestinationSession, name: str
+) -> DestinationHealth:
+    # Sessions built by tests (or older callers) may not carry a health
+    # map yet; attach one lazily instead of crashing on the attribute.
+    health_map = getattr(session, "health", None)
+    if not isinstance(health_map, dict):
+        health_map = {}
+        try:
+            session.health = health_map
+        except Exception:
+            pass
+    return health_map.setdefault(name, DestinationHealth())
+
+
+def _record_destination_failure(
+    session: DestinationSession, name: str
+) -> DestinationHealth:
+    health = _destination_health(session, name)
+    health.consecutive_failures += 1
+    health.total_failures += 1
+    return health
+
+
+def _record_destination_stable(
+    session: DestinationSession, name: str, notifier: Notifier | None
+) -> None:
+    """A worker that ran stably clears its destination's failure history.
+
+    The trip counter resets too, so the next failure series starts again
+    from the shortest cooldown. Notifies once when a destination that
+    had tripped its breaker recovers.
+    """
+    health_map = getattr(session, "health", None)
+    if not isinstance(health_map, dict):
+        return
+    health = health_map.get(name)
+    if health is None:
+        return
+    was_tripped = health.breaker_trips > 0 or health.breaker_open
+    health.consecutive_failures = 0
+    health.breaker_trips = 0
+    health.breaker_open_since = None
+    health.next_retry_at = 0.0
+    health.notified_exhausted = False
+    if was_tripped:
+        logging.info("%s recovered after a stable run", name)
+        if notifier is not None:
+            notifier.notify("destination_recovered", platform=name)
+
+
+def _recover_destination(session: DestinationSession, name: str) -> None:
+    """Best-effort recreation of one dead destination (H6).
+
+    Only a provably dead platform event is replaced (see
+    ``recreate_destination``); a failure here just keeps the breaker
+    open, and the next probe retries the recreation.
+    """
+    metadata = getattr(session, "metadata", None) or getattr(
+        session, "base_metadata", None
+    )
+    if metadata is None:
+        return
+    try:
+        new_url = recreate_destination(session, name, metadata)
+    except Exception as exc:
+        logging.warning(
+            "Could not recreate the %s destination: %s",
+            name,
+            redact_urls(str(exc))[:200],
+        )
+        return
+    if new_url:
+        logging.info("%s destination recreated with a fresh platform event", name)
+
+
+def _open_breaker(
+    session: DestinationSession,
+    worker: WorkerState,
+    health: DestinationHealth,
+    now: float,
+    notifier: Notifier | None,
+) -> None:
+    """Open the circuit breaker for a destination and try to recover it.
+
+    The worker is left stopped until ``next_retry_at``; the next probe
+    then gets a fresh failure budget. Recovery is attempted once per
+    trip, right when the breaker opens.
+    """
+    health.breaker_trips += 1
+    health.breaker_open_since = now
+    cooldown = _breaker_cooldown(health.breaker_trips)
+    health.next_retry_at = now + cooldown
+    worker.exhausted = True
+    worker.next_start = health.next_retry_at
+    if not worker.failure_reason:
+        worker.failure_reason = (
+            "Stopped after five failed output attempts; verify "
+            "the stream key, destination access, and network"
+        )
+    logging.error(
+        "%s exhausted its %d output attempts; cooling down for %.0fs "
+        "before the next probe",
+        worker.name,
+        health.consecutive_failures,
+        cooldown,
+    )
+    if not health.notified_exhausted:
+        health.notified_exhausted = True
+        if notifier is not None:
+            notifier.notify(
+                "destination_failed",
+                platform=worker.name,
+                reason=worker.failure_reason,
+                reconnect_in=f"{cooldown:.0f}s",
+            )
+    _recover_destination(session, worker.name)
+
+
+def _note_worker_failure(
+    session: DestinationSession,
+    worker: WorkerState,
+    notifier: Notifier | None,
+    now: float,
+    reason: str,
+) -> None:
+    """Count one worker failure against its destination's breaker.
+
+    The per-call ``worker.failures`` counter still drives the short
+    restart backoff; the session-level counter drives the breaker, so a
+    destination that fails across supervision re-entries trips the
+    breaker instead of retrying forever.
+    """
+    worker.failures += 1
+    worker.failure_reason = reason
+    health = _record_destination_failure(session, worker.name)
+    if (
+        health.consecutive_failures >= DESTINATION_MAX_CONSECUTIVE_FAILURES
+        and not health.breaker_open
+    ):
+        _open_breaker(session, worker, health, now, notifier)
 
 
 @dataclass
@@ -470,49 +649,53 @@ def _start_encoder(
             any_running = False
             restartable = False
             for worker in workers:
+                health = _destination_health(session, worker.name)
+                if health.breaker_open:
+                    # Circuit breaker: this destination is cooling down
+                    # after repeated failures. It is skipped (not counted
+                    # as restartable) until its probe time, then it gets
+                    # a fresh failure budget.
+                    if now < health.next_retry_at:
+                        worker.exhausted = True
+                        continue
+                    logging.info(
+                        "Probing %s again after its cooldown", worker.name
+                    )
+                    health.breaker_open_since = None
+                    health.consecutive_failures = 0
+                    health.notified_exhausted = False
+                    worker.exhausted = False
+                    worker.failures = 0
                 if worker.running:
                     any_running = True
                     restartable = True
                     if now - worker.started_at >= WORKER_STABLE_SECONDS:
                         worker.failures = 0
+                        _record_destination_stable(session, worker.name, notifier)
                     continue
                 if worker.process is not None:
                     returncode = worker.process.returncode
                     _teardown_worker(worker)
                     transport_failed = worker.transport_failure.is_set()
-                    worker.failure_reason = (
+                    _note_worker_failure(
+                        session,
+                        worker,
+                        notifier,
+                        now,
                         _transport_failure_reason(worker.name)
                         if transport_failed
-                        else f"FFmpeg exited with code {_format_exit_code(returncode)}"
+                        else f"FFmpeg exited with code {_format_exit_code(returncode)}",
                     )
-                    if notifier is not None:
-                        notifier.notify(
-                            "destination_failed",
-                            platform=worker.name,
-                            reason=worker.failure_reason,
-                            reconnect_in=f"{_worker_backoff(worker.failures + 1):.0f}s",
-                        )
                     logging.warning(
                         "%s encoder exited with code %s; scheduling a restart",
                         worker.name,
                         _format_exit_code(returncode),
                     )
-                    worker.failures += 1
+                    if worker.exhausted:
+                        # The breaker opened; the worker stays stopped
+                        # until its probe time.
+                        continue
                     worker.next_start = now + _worker_backoff(worker.failures)
-                if worker.failures >= WORKER_MAX_CONSECUTIVE_FAILURES:
-                    if not worker.exhausted:
-                        worker.exhausted = True
-                        if not worker.failure_reason:
-                            worker.failure_reason = (
-                                "Stopped after five failed output attempts; verify "
-                                "the stream key, destination access, and network"
-                            )
-                        logging.error(
-                            "%s exhausted its %d output attempts; leaving it stopped",
-                            worker.name,
-                            worker.failures,
-                        )
-                    continue
                 restartable = True
                 if now >= worker.next_start:
                     current = refresh_source() if worker.failures else source
@@ -521,43 +704,61 @@ def _start_encoder(
                     ):
                         any_running = True
                     else:
-                        worker.failures += 1
-                        worker.failure_reason = (
-                            "FFmpeg or yt-dlp could not start; see the log for details"
+                        _note_worker_failure(
+                            session,
+                            worker,
+                            notifier,
+                            now,
+                            "FFmpeg or yt-dlp could not start; see the log for details",
                         )
-                        worker.next_start = now + _worker_backoff(worker.failures)
+                        if not worker.exhausted:
+                            worker.next_start = now + _worker_backoff(worker.failures)
             for worker in workers:
                 if not worker.running:
                     continue
                 if worker.transport_failure.is_set():
-                    worker.failure_reason = _transport_failure_reason(worker.name)
+                    _teardown_worker(worker)
+                    _note_worker_failure(
+                        session,
+                        worker,
+                        notifier,
+                        time.monotonic(),
+                        _transport_failure_reason(worker.name),
+                    )
                     logging.error(
                         "FFmpeg for %s reported an output transport failure; "
                         "restarting it",
                         worker.name,
                     )
-                    _teardown_worker(worker)
-                    worker.failures += 1
-                    worker.next_start = time.monotonic() + _worker_backoff(
-                        worker.failures
-                    )
+                    if not worker.exhausted:
+                        worker.next_start = time.monotonic() + _worker_backoff(
+                            worker.failures
+                        )
                     continue
                 if worker.progress.stalled(settings.stall_timeout):
-                    worker.failure_reason = (
-                        f"No output progress for {settings.stall_timeout} seconds"
+                    _teardown_worker(worker)
+                    _note_worker_failure(
+                        session,
+                        worker,
+                        notifier,
+                        time.monotonic(),
+                        f"No output progress for {settings.stall_timeout} seconds",
                     )
                     logging.error(
                         "Output to %s made no progress for %s seconds; restarting it",
                         worker.name,
                         settings.stall_timeout,
                     )
-                    _teardown_worker(worker)
-                    worker.failures += 1
-                    worker.next_start = time.monotonic() + _worker_backoff(
-                        worker.failures
-                    )
+                    if not worker.exhausted:
+                        worker.next_start = time.monotonic() + _worker_backoff(
+                            worker.failures
+                        )
             _update_worker_status(status, session, workers)
-            if not restartable and not any_running:
+            cooling = any(
+                _destination_health(session, worker.name).breaker_open
+                for worker in workers
+            )
+            if not restartable and not any_running and not cooling:
                 reason = "gave-up"
                 logging.error(
                     "Every destination exhausted its restart budget; "
@@ -620,15 +821,19 @@ def _start_encoder(
                         )
                         no_data_streak = 0
                         for worker in running:
-                            worker.failure_reason = (
-                                "YouTube reported no incoming data; "
-                                "restarting the ingest"
-                            )
                             _teardown_worker(worker)
-                            worker.failures += 1
-                            worker.next_start = time.monotonic() + _worker_backoff(
-                                worker.failures
+                            _note_worker_failure(
+                                session,
+                                worker,
+                                notifier,
+                                time.monotonic(),
+                                "YouTube reported no incoming data; "
+                                "restarting the ingest",
                             )
+                            if not worker.exhausted:
+                                worker.next_start = time.monotonic() + _worker_backoff(
+                                    worker.failures
+                                )
                         _update_worker_status(status, session, workers)
                         continue
                 elif running:
@@ -666,7 +871,8 @@ def _session_is_dead(session: DestinationSession) -> bool:
     live yet, and YouTube moves it to "live" as soon as the encoder
     connects. Discarding it here would mint a brand-new event (and a new
     watch URL) on every gave-up retry instead of resuming the same one.
-    Only "complete" (ended) and "revoked" (withdrawn) can never go live.
+    Only "complete" (ended) and "revoked" (withdrawn) can never go live,
+    and a stream in "error" state can never receive data again.
     """
     if session.youtube:
         try:
@@ -676,7 +882,10 @@ def _session_is_dead(session: DestinationSession) -> bool:
                 "YouTube session check failed: %s", redact_urls(str(exc))[:200]
             )
             return False
-        return state.get("broadcast_status") in {"complete", "revoked"}
+        return state.get("broadcast_status") in {
+            "complete",
+            "revoked",
+        } or state.get("stream_status") == "error"
     return False
 
 

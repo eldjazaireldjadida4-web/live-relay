@@ -42,6 +42,30 @@ def _youtube_service(credentials: Any):
 
 
 @dataclass
+class DestinationHealth:
+    """Per-destination failure history that outlives one supervision pass.
+
+    Encoder supervision rebuilds its worker state on every re-entry, so
+    consecutive-failure counting cannot live on the worker: a permanently
+    failing destination would otherwise retry forever at full speed. The
+    health record survives across re-entries and drives the circuit
+    breaker: after enough consecutive failures the destination cools down
+    with an escalating delay before the next probe attempt.
+    """
+
+    consecutive_failures: int = 0
+    total_failures: int = 0
+    breaker_trips: int = 0
+    breaker_open_since: float | None = None
+    next_retry_at: float = 0.0
+    notified_exhausted: bool = False
+
+    @property
+    def breaker_open(self) -> bool:
+        return self.breaker_open_since is not None
+
+
+@dataclass
 class DestinationSession:
     targets: list[tuple[str, str]] = field(default_factory=list)
     youtube: "YouTubeDestination | None" = None
@@ -52,6 +76,7 @@ class DestinationSession:
     base_metadata: StreamMetadata | None = None
     manual_metadata_override: bool = False
     ignore_config_overrides: bool = False
+    health: dict[str, DestinationHealth] = field(default_factory=dict)
 
     @property
     def active_platforms(self) -> list[str]:
@@ -406,10 +431,15 @@ class YouTubeDestination:
                 # Reuse only an idle saved stream. An "active" stream may still
                 # be fed by another encoder (or a previous process that has not
                 # timed out yet); reusing it would hijack that ingest, so an
-                # active stream gets a fresh reusable one instead. The old
-                # stream is then orphaned on YouTube, which is the safe side
-                # of that trade-off.
-                if items and items[0].get("status", {}).get("streamStatus") != "active":
+                # active stream gets a fresh reusable one instead. An "error"
+                # stream can never receive data again, and a "created" stream
+                # has no usable ingest settings yet, so those get a fresh
+                # stream too. The old stream is then orphaned on YouTube,
+                # which is the safe side of that trade-off.
+                if items and items[0].get("status", {}).get("streamStatus") in {
+                    "ready",
+                    "inactive",
+                }:
                     stream = items[0]
         except (OSError, ValueError, AttributeError, TypeError):
             stream = None
@@ -516,18 +546,23 @@ class YouTubeDestination:
     def update_title(self, title: str) -> None:
         self.update_metadata(title)
 
+    def end_broadcast(self, broadcast: dict[str, Any] | None) -> None:
+        """Mark one (usually previous) broadcast complete; never raises."""
+        if not broadcast or not self.service:
+            return
+        try:
+            self.service.liveBroadcasts().transition(
+                part="status", id=broadcast["id"], broadcastStatus="complete"
+            ).execute()
+            logging.info("YouTube broadcast marked complete")
+        except Exception as exc:
+            logging.warning(
+                "YouTube broadcast could not be marked complete: %s",
+                _safe_error(exc),
+            )
+
     def stop(self) -> None:
-        if self.broadcast and self.service:
-            try:
-                self.service.liveBroadcasts().transition(
-                    part="status", id=self.broadcast["id"], broadcastStatus="complete"
-                ).execute()
-                logging.info("YouTube broadcast marked complete")
-            except Exception as exc:
-                logging.warning(
-                    "YouTube broadcast could not be marked complete: %s",
-                    _safe_error(exc),
-                )
+        self.end_broadcast(self.broadcast)
         self.broadcast = None
         self.stream = None
 
@@ -647,21 +682,26 @@ class FacebookDestination:
     def update_title(self, title: str) -> None:
         self.update_metadata(title)
 
+    def end_live_video(self, video_id: str | None) -> None:
+        """End one live video by id; never raises."""
+        if not video_id:
+            return
+        try:
+            self._post(
+                video_id,
+                {
+                    "end_live_video": "true",
+                    "access_token": self.settings.facebook_access_token,
+                },
+            )
+            logging.info("Facebook live video ended")
+        except Exception as exc:
+            logging.warning(
+                "Facebook live video could not be ended: %s", _safe_error(exc)
+            )
+
     def stop(self) -> None:
-        if self.live_video_id:
-            try:
-                self._post(
-                    self.live_video_id,
-                    {
-                        "end_live_video": "true",
-                        "access_token": self.settings.facebook_access_token,
-                    },
-                )
-                logging.info("Facebook live video ended")
-            except Exception as exc:
-                logging.warning(
-                    "Facebook live video could not be ended: %s", _safe_error(exc)
-                )
+        self.end_live_video(self.live_video_id)
         self.live_video_id = None
 
 
@@ -828,3 +868,69 @@ def close_destinations(session: DestinationSession) -> None:
             session.youtube.stop()
         session.targets.clear()
         session.failures.clear()
+
+
+def recreate_destination(
+    session: DestinationSession, name: str, metadata: StreamMetadata | str
+) -> str | None:
+    """Recreate one dead destination in place; return its new target URL.
+
+    Returns ``None`` when the destination should not be recreated:
+    static-key destinations have a fixed URL, and a YouTube broadcast
+    that is still usable (live, ready, or created with a healthy stream)
+    is kept — only a provably dead broadcast (``complete``/``revoked``)
+    or a stream in ``error`` state is replaced. Raises on API failure so
+    the caller can keep the circuit breaker open and retry later.
+
+    The new platform event is created first and the old one is ended
+    afterwards, so a failed recreation never leaves the destination
+    without an event at all.
+    """
+    if name == "facebook" and session.facebook is not None:
+        old_video_id = session.facebook.live_video_id
+        targets = session.facebook.start(metadata)
+        session.facebook.end_live_video(old_video_id)
+        new_targets = dict(targets)
+        with session.lock:
+            session.targets = [
+                (target_name, new_targets.get(target_name, url))
+                for target_name, url in session.targets
+            ]
+            session.failures.pop("facebook", None)
+        return new_targets.get("facebook")
+    if name == "youtube" and session.youtube is not None:
+        try:
+            state = session.youtube.check_status()
+        except Exception:
+            # The broadcast cannot be proven dead; keep it and let the
+            # cooldown retry the same ingest URL.
+            return None
+        dead = state.get("broadcast_status") in {
+            "complete",
+            "revoked",
+        } or state.get("stream_status") == "error"
+        if not dead:
+            return None
+        old_broadcast = session.youtube.broadcast
+        try:
+            targets = session.youtube.start(metadata)
+        except Exception:
+            # If start() already minted a replacement broadcast, end that
+            # partial one; the previous broadcast stays untouched.
+            if (
+                session.youtube.broadcast is not None
+                and session.youtube.broadcast is not old_broadcast
+            ):
+                session.youtube.stop()
+            raise
+        session.youtube.end_broadcast(old_broadcast)
+        new_targets = dict(targets)
+        with session.lock:
+            session.targets = [
+                (target_name, new_targets.get(target_name, url))
+                for target_name, url in session.targets
+            ]
+            session.failures.pop("youtube", None)
+            session.failures.pop("youtube-backup", None)
+        return new_targets.get("youtube")
+    return None

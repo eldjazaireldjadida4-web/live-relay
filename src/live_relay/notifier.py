@@ -16,12 +16,14 @@ _EVENT_LABELS = {
     "ar": {
         "session_started": "🔴 بدأ البث المباشر",
         "destination_failed": "⚠️ مقاطعة في وجهة بث",
+        "destination_recovered": "✅ عادت وجهة بث",
         "relay_ended": "⏹️ انتهى البث",
         "relay_stopped": "⏹️ تم إيقاف المُرحِّل",
     },
     "en": {
         "session_started": "🔴 Live relay started",
         "destination_failed": "⚠️ Destination interrupted",
+        "destination_recovered": "✅ Destination recovered",
         "relay_ended": "⏹️ Live relay ended",
         "relay_stopped": "⏹️ Relay stopped",
     },

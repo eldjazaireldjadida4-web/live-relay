@@ -1308,10 +1308,18 @@ class CbrAndStarvationTests(unittest.TestCase):
         )
         self.assertIn("thread_queue_size", " ".join(command[0]))
 
-    def test_quality_no_data_counts_as_slow(self):
+    def test_quality_bad_health_counts_as_slow(self):
+        quality = AdaptiveQuality("720p")
+        self.assertIsNone(quality.observe(1.0, 0.0, "bad"))
+        self.assertEqual(quality.observe(1.0, 1.0, "bad"), "lower")
+
+    def test_quality_no_data_health_is_unknown_not_slow(self):
+        # YouTube's ``noData`` (normalised to ``no_data``) means YouTube has
+        # no health information, not that the ingest is slow.
         quality = AdaptiveQuality("720p")
         self.assertIsNone(quality.observe(1.0, 0.0, "no_data"))
-        self.assertEqual(quality.observe(1.0, 1.0, "no_data"), "lower")
+        self.assertIsNone(quality.observe(1.0, 1.0, "no_data"))
+        self.assertIsNone(quality.observe(1.0, 2.0, "no_data"))
 
 
 class WorkerDiagnosticsTests(unittest.TestCase):

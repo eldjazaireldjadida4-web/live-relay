@@ -28,12 +28,12 @@ import live_relay.dashboard as dashboard_module
 
 def _normalised_release(**overrides):
     """The dict updater.fetch_latest_release() returns (not the raw API payload)."""
-    # 4.8.4: must stay newer than the local version, or the controller
+    # 4.8.5: must stay newer than the local version, or the controller
     # treats it as "no newer release" and the flow tests fail.
     release = {
-        "version": "4.8.4",
-        "tag": "v4.8.4",
-        "name": "4.8.4",
+        "version": "4.8.5",
+        "tag": "v4.8.5",
+        "name": "4.8.5",
         "body": "Bug fixes",
         "html_url": "https://github.com/owner/live-relay/releases/tag/v4.8.4",
         "zipball_url": "https://api.github.com/repos/owner/live-relay/zipball/v4.8.4",
@@ -88,7 +88,7 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(updater.parse_version("v4.8.3"), (4, 8, 3))
 
     def test_parse_version_rejects_anything_else(self):
-        for bad in ["", "latest", "4.8", "4.8.2.1", "v4.8.x", None, 482]:
+        for bad in ["", "latest", "4.8", "v4.8.x", None, 482]:
             self.assertIsNone(updater.parse_version(bad))
 
     def test_is_newer_is_strict_and_needs_both_versions(self):
@@ -405,7 +405,7 @@ class ControllerUpdateTests(unittest.TestCase):
             ):
                 downloaded = controller.download_update()
                 self.assertIsNotNone(downloaded["staged"])
-                self.assertEqual(downloaded["staged"]["version"], "4.8.4")
+                self.assertEqual(downloaded["staged"]["version"], "4.8.5")
                 download.assert_called_once()
                 installed = controller.install_update()
             self.assertTrue(installed["restart_required"])

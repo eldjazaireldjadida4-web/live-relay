@@ -28,13 +28,15 @@ import live_relay.dashboard as dashboard_module
 
 def _normalised_release(**overrides):
     """The dict updater.fetch_latest_release() returns (not the raw API payload)."""
+    # 4.8.4: must stay newer than the local version, or the controller
+    # treats it as "no newer release" and the flow tests fail.
     release = {
-        "version": "4.8.3",
-        "tag": "v4.8.3",
-        "name": "4.8.3",
+        "version": "4.8.4",
+        "tag": "v4.8.4",
+        "name": "4.8.4",
         "body": "Bug fixes",
-        "html_url": "https://github.com/owner/live-relay/releases/tag/v4.8.3",
-        "zipball_url": "https://api.github.com/repos/owner/live-relay/zipball/v4.8.3",
+        "html_url": "https://github.com/owner/live-relay/releases/tag/v4.8.4",
+        "zipball_url": "https://api.github.com/repos/owner/live-relay/zipball/v4.8.4",
         "assets": [],
     }
     release.update(overrides)
@@ -403,7 +405,7 @@ class ControllerUpdateTests(unittest.TestCase):
             ):
                 downloaded = controller.download_update()
                 self.assertIsNotNone(downloaded["staged"])
-                self.assertEqual(downloaded["staged"]["version"], "4.8.3")
+                self.assertEqual(downloaded["staged"]["version"], "4.8.4")
                 download.assert_called_once()
                 installed = controller.install_update()
             self.assertTrue(installed["restart_required"])
@@ -466,7 +468,11 @@ class UpdateHttpTests(unittest.TestCase):
         return f"http://127.0.0.1:{self.port}"
 
     def test_update_status_endpoint_reports_the_current_version(self):
-        response = requests.get(f"{self.base_url()}/api/update", timeout=5)
+        response = requests.get(
+            f"{self.base_url()}/api/update",
+            headers={"X-Relay-Token": self.controller.control_token},
+            timeout=5,
+        )
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["current_version"], __version__)

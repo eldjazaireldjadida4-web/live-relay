@@ -319,8 +319,14 @@ class DashboardHttpTests(unittest.TestCase):
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def test_config_endpoint_is_read_only_without_token(self):
-        response = requests.get(f"{self.base_url()}/api/config", timeout=5)
+    def test_config_endpoint_requires_the_control_token(self):
+        denied = requests.get(f"{self.base_url()}/api/config", timeout=5)
+        self.assertEqual(denied.status_code, 403)
+        response = requests.get(
+            f"{self.base_url()}/api/config",
+            headers={"X-Relay-Token": self.controller.control_token},
+            timeout=5,
+        )
         self.assertEqual(response.status_code, 200)
         self.assertIn("missing", response.json())
 
@@ -366,7 +372,11 @@ class DashboardHttpTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["applied_now"])
-        config = requests.get(f"{self.base_url()}/api/config", timeout=5).json()
+        config = requests.get(
+            f"{self.base_url()}/api/config",
+            headers={"X-Relay-Token": self.controller.control_token},
+            timeout=5,
+        ).json()
         self.assertEqual(config["youtube_title_override"], "عنوان يدوي للبث")
         self.assertEqual(config["youtube_description_override"], "وصف مختصر")
         self.assertEqual(config["youtube_tags_override"], "أخبار, مباشر, تحليل")
@@ -393,7 +403,11 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(saved.read_bytes(), image)
         if os.name != "nt":
             self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
-        config = requests.get(f"{self.base_url()}/api/config", timeout=5).json()
+        config = requests.get(
+            f"{self.base_url()}/api/config",
+            headers={"X-Relay-Token": self.controller.control_token},
+            timeout=5,
+        ).json()
         self.assertTrue(config["youtube_thumbnail_ready"])
         preview = requests.get(
             f"{self.base_url()}/api/youtube/thumbnail",
@@ -429,7 +443,11 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(cleared.status_code, 200)
         self.assertFalse(saved.exists())
         self.assertFalse(hold_after(self.state_dir))
-        config = requests.get(f"{self.base_url()}/api/config", timeout=5).json()
+        config = requests.get(
+            f"{self.base_url()}/api/config",
+            headers={"X-Relay-Token": self.controller.control_token},
+            timeout=5,
+        ).json()
         self.assertFalse(config["youtube_thumbnail_ready"])
         self.assertEqual(config["thumbnail_provider"], "")
 

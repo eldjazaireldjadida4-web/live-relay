@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "live-relay"
+version = "4.8.2"
+description = "TikTok, YouTube, and Facebook Live relay with editable metadata, custom thumbnails, and adaptive branded frames"
+requires-python = ">=3.10"
+dependencies = [
+  "yt-dlp[curl-cffi]>=2026.10.21",
+  "imageio-ffmpeg>=0.5.1",
+  "python-dotenv>=1.0.1",
+  "google-api-python-client>=2.160.0",
+  "google-auth-oauthlib>=1.2.1",
+  "google-auth-httplib2>=0.2.0",
+  "requests>=2.32.3",
+]
+
+[project.scripts]
+live-relay = "live_relay.main:main"
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[tool.setuptools.package-data]
+live_relay = [
+  "dashboard.html",
+  ".env.example",
+  "stream-logo.png",
+  "oussama-news-frame-landscape.png",
+  "oussama-news-frame-portrait.png",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

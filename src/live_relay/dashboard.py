@@ -52,6 +52,7 @@ SECRET_KEYS = (
     "YOUTUBE_STREAM_KEY",
     "FACEBOOK_ACCESS_TOKEN",
     "FACEBOOK_STREAM_KEY",
+    "TIKTOK_STREAM_KEY",
     "GEMINI_API_KEY",
 )
 CONFIG_KEYS = (
@@ -69,6 +70,7 @@ CONFIG_KEYS = (
     "YOUTUBE_TAGS_OVERRIDE",
     "FACEBOOK_TARGET_ID",
     "FACEBOOK_GRAPH_VERSION",
+    "TIKTOK_RTMP_URL",
     "GEMINI_MODEL",
     "GEMINI_METADATA_ENABLED",
     "METADATA_LANGUAGE",
@@ -121,6 +123,7 @@ def _default_value(key: str) -> str:
         "YOUTUBE_TAGS_OVERRIDE": "",
         "FACEBOOK_TARGET_ID": "me",
         "FACEBOOK_GRAPH_VERSION": "v26.0",
+        "TIKTOK_RTMP_URL": "rtmp://rtmp-push.tiktok.com/live",
         "GEMINI_MODEL": "gemini-3.8-flash",
         "GEMINI_METADATA_ENABLED": "true",
         "METADATA_LANGUAGE": "ar",
@@ -316,6 +319,15 @@ class DashboardController:
                 missing.append(
                     "للبث إلى Facebook، أضف رمز وصول Meta Live Video API أو مفتاح بث ثابت."
                 )
+        if "tiktok" in platforms:
+            if values.get("TIKTOK_STREAM_KEY", "").strip():
+                notes.append(
+                    "وضع المفتاح الثابت لـ TikTok: أنشئ البث على TikTok أولاً وانسخ رابط الخادم والمفتاح للجلسة الحالية؛ المفتاح لمرة واحدة وينتهي، ولن ينشئ البرنامج البث ولا يزامن العنوان."
+                )
+            else:
+                missing.append(
+                    "للبث إلى TikTok، أنشئ البث على TikTok وأضف رابط خادم RTMP ومفتاح البث للجلسة."
+                )
         gemini_enabled = _as_bool(values.get("GEMINI_METADATA_ENABLED", "true"))
         gemini_key_set = bool(values.get("GEMINI_API_KEY", "").strip())
         if gemini_enabled and metadata_api_enabled and not gemini_key_set:
@@ -414,6 +426,12 @@ class DashboardController:
             "facebook_static_key_set": bool(
                 values.get("FACEBOOK_STREAM_KEY", "").strip()
             ),
+            "tiktok_rtmp_url": values.get(
+                "TIKTOK_RTMP_URL", _default_value("TIKTOK_RTMP_URL")
+            ),
+            "tiktok_static_key_set": bool(
+                values.get("TIKTOK_STREAM_KEY", "").strip()
+            ),
             "facebook_token_age_days": self._facebook_token_age_days(values),
             "facebook_token_stale": self._facebook_token_stale(values),
             "initial_profile": values.get("INITIAL_PROFILE", "720p"),
@@ -471,9 +489,9 @@ class DashboardController:
                 if part.strip()
             ]
             if not platforms or any(
-                item not in {"youtube", "facebook"} for item in platforms
+                item not in {"youtube", "facebook", "tiktok"} for item in platforms
             ):
-                raise ValueError("Choose YouTube, Facebook, or both")
+                raise ValueError("Choose YouTube, Facebook, TikTok, or any of them")
             if "YOUTUBE_MODE" in updates and updates["YOUTUBE_MODE"] not in {
                 "auto",
                 "api",
@@ -605,6 +623,16 @@ class DashboardController:
                 r"v[0-9]+\.[0-9]+", updates["FACEBOOK_GRAPH_VERSION"]
             ):
                 raise ValueError("The Facebook Graph version should look like v26.0")
+            if "TIKTOK_RTMP_URL" in updates and updates["TIKTOK_RTMP_URL"]:
+                parsed_tiktok = urlsplit(updates["TIKTOK_RTMP_URL"])
+                if (
+                    parsed_tiktok.scheme not in {"rtmp", "rtmps"}
+                    or not parsed_tiktok.hostname
+                ):
+                    raise ValueError(
+                        "TIKTOK_RTMP_URL must be an RTMP URL, for example "
+                        "rtmp://rtmp-push.tiktok.com/live"
+                    )
             if "FFMPEG_PRESET" in updates and updates["FFMPEG_PRESET"] not in {
                 "ultrafast",
                 "superfast",
@@ -1197,6 +1225,7 @@ class DashboardController:
                 getattr(settings, "youtube_static_key", ""),
                 getattr(settings, "facebook_access_token", ""),
                 getattr(settings, "facebook_static_key", ""),
+                getattr(settings, "tiktok_static_key", ""),
             ):
                 if secret:
                     message = message.replace(secret, "[secret hidden]")

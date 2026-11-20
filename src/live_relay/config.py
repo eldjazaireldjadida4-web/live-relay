@@ -37,6 +37,12 @@ class Settings:
     facebook_target_id: str
     facebook_graph_version: str
     facebook_static_key: str
+    # TikTok has no public API to create a live (its Live API is
+    # invitation/partner-only), so TikTok is a static RTMP destination
+    # only: the user creates the live on TikTok and pastes the Server
+    # URL + stream key TikTok shows for that session.
+    tiktok_rtmp_url: str
+    tiktok_static_key: str
     gemini_api_key: str
     gemini_model: str
     gemini_metadata_enabled: bool
@@ -141,9 +147,12 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
             part.strip().lower() for part in raw_platforms.split(",") if part.strip()
         )
     )
-    if not platforms or any(item not in {"youtube", "facebook"} for item in platforms):
+    if not platforms or any(
+        item not in {"youtube", "facebook", "tiktok"} for item in platforms
+    ):
         raise ValueError(
-            "LIVE_PLATFORMS must be a comma-separated list of youtube and/or facebook"
+            "LIVE_PLATFORMS must be a comma-separated list of youtube, "
+            "facebook, and/or tiktok"
         )
     source_url = os.getenv(
         "SOURCE_URL",
@@ -226,6 +235,30 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
         )
     if not re.fullmatch(r"v[0-9]+\.[0-9]+", facebook_version):
         raise ValueError("FACEBOOK_GRAPH_VERSION must look like v26.0")
+    # TikTok: paste the exact Server URL TikTok shows for the session.
+    # The default is the ingest host most commonly reported for TikTok
+    # RTMP; TikTok picks a regional host per session, so always prefer
+    # the URL it displays over this default.
+    tiktok_rtmp_url = os.getenv(
+        "TIKTOK_RTMP_URL", "rtmp://rtmp-push.tiktok.com/live"
+    ).strip()
+    tiktok_static_key = os.getenv("TIKTOK_STREAM_KEY", "").strip()
+    if "tiktok" in platforms:
+        parsed_tiktok = urlsplit(tiktok_rtmp_url)
+        if (
+            parsed_tiktok.scheme not in {"rtmp", "rtmps"}
+            or not parsed_tiktok.hostname
+        ):
+            raise ValueError(
+                "TIKTOK_RTMP_URL must be an RTMP URL, for example "
+                "rtmp://rtmp-push.tiktok.com/live"
+            )
+        if not tiktok_static_key:
+            raise ValueError(
+                "TikTok requires TIKTOK_STREAM_KEY (and TIKTOK_RTMP_URL): "
+                "create the live on TikTok first and paste the Server URL "
+                "and stream key it shows for that session"
+            )
     gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
     if not re.fullmatch(r"gemini-[A-Za-z0-9._-]+", gemini_model):
@@ -346,6 +379,8 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
         facebook_target_id=facebook_target,
         facebook_graph_version=facebook_version,
         facebook_static_key=facebook_static_key,
+        tiktok_rtmp_url=tiktok_rtmp_url,
+        tiktok_static_key=tiktok_static_key,
         gemini_api_key=gemini_api_key,
         gemini_model=gemini_model,
         gemini_metadata_enabled=gemini_metadata_enabled,

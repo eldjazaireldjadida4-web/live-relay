@@ -785,6 +785,20 @@ def open_destinations(
             session.failures["facebook"] = (
                 "Facebook has no access token or static stream key configured"
             )
+    if "tiktok" in settings.platforms:
+        if settings.tiktok_rtmp_url and settings.tiktok_static_key:
+            base = settings.tiktok_rtmp_url.rstrip("/")
+            session.targets.append(
+                ("tiktok", f"{base}/{settings.tiktok_static_key}")
+            )
+            logging.warning(
+                "TikTok static-key mode cannot create live videos or "
+                "synchronize titles"
+            )
+        else:
+            session.failures["tiktok"] = (
+                "TikTok has no RTMP server URL or stream key configured"
+            )
     if not session.targets:
         details = "; ".join(
             f"{name}: {error}" for name, error in session.failures.items()

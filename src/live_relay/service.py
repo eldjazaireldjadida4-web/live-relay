@@ -159,7 +159,7 @@ def _destination_status(
     active_platforms: list[str] | None = None,
     failures: dict[str, str] | None = None,
 ) -> tuple[str, str]:
-    labels = {"youtube": "YouTube", "facebook": "Facebook"}
+    labels = {"youtube": "YouTube", "facebook": "Facebook", "tiktok": "TikTok"}
     active_platforms = (
         session.active_platforms if active_platforms is None else active_platforms
     )
@@ -240,6 +240,12 @@ def _transport_failure_reason(platform: str) -> str:
         return (
             "Facebook RTMPS/TLS connection failed; verify its stream key, "
             "Live Producer access, and outbound network"
+        )
+    if platform == "tiktok":
+        return (
+            "TikTok RTMP connection failed; the stream key is issued per "
+            "live session and expires, so create a new live on TikTok and "
+            "paste its fresh Server URL and stream key, then restart"
         )
     if platform == "youtube":
         return (

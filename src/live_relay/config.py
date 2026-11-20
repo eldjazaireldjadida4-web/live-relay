@@ -43,6 +43,12 @@ class Settings:
     # URL + stream key TikTok shows for that session.
     tiktok_rtmp_url: str
     tiktok_static_key: str
+    # Generic RTMP destination (Restream bridge): Restream is a TikTok
+    # partner, so one push to its permanent RTMP ingest lets Restream
+    # create the TikTok live automatically — no per-session TikTok key.
+    custom_rtmp_url: str
+    custom_stream_key: str
+    custom_rtmp_name: str
     gemini_api_key: str
     gemini_model: str
     gemini_metadata_enabled: bool
@@ -148,11 +154,12 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
         )
     )
     if not platforms or any(
-        item not in {"youtube", "facebook", "tiktok"} for item in platforms
+        item not in {"youtube", "facebook", "tiktok", "custom"}
+        for item in platforms
     ):
         raise ValueError(
             "LIVE_PLATFORMS must be a comma-separated list of youtube, "
-            "facebook, and/or tiktok"
+            "facebook, tiktok, and/or custom"
         )
     source_url = os.getenv(
         "SOURCE_URL",
@@ -258,6 +265,30 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
                 "TikTok requires TIKTOK_STREAM_KEY (and TIKTOK_RTMP_URL): "
                 "create the live on TikTok first and paste the Server URL "
                 "and stream key it shows for that session"
+            )
+    # Restream bridge: its RTMP URL + key are permanent for the account
+    # (unlike TikTok's per-session key), so paste them once and every
+    # relay start goes live on TikTok through Restream automatically.
+    custom_rtmp_url = os.getenv(
+        "CUSTOM_RTMP_URL", "rtmp://live.restream.io/live"
+    ).strip()
+    custom_stream_key = os.getenv("CUSTOM_STREAM_KEY", "").strip()
+    custom_rtmp_name = os.getenv("CUSTOM_RTMP_NAME", "Restream").strip()
+    if "custom" in platforms:
+        parsed_custom = urlsplit(custom_rtmp_url)
+        if (
+            parsed_custom.scheme not in {"rtmp", "rtmps"}
+            or not parsed_custom.hostname
+        ):
+            raise ValueError(
+                "CUSTOM_RTMP_URL must be an RTMP URL, for example "
+                "rtmp://live.restream.io/live"
+            )
+        if not custom_stream_key:
+            raise ValueError(
+                "Custom RTMP requires CUSTOM_STREAM_KEY: copy the RTMP URL "
+                "and stream key from Restream (Settings > RTMP) and paste "
+                "them once — they are permanent for the account"
             )
     gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
@@ -381,6 +412,9 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
         facebook_static_key=facebook_static_key,
         tiktok_rtmp_url=tiktok_rtmp_url,
         tiktok_static_key=tiktok_static_key,
+        custom_rtmp_url=custom_rtmp_url,
+        custom_stream_key=custom_stream_key,
+        custom_rtmp_name=custom_rtmp_name,
         gemini_api_key=gemini_api_key,
         gemini_model=gemini_model,
         gemini_metadata_enabled=gemini_metadata_enabled,

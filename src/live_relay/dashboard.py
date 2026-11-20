@@ -53,6 +53,7 @@ SECRET_KEYS = (
     "FACEBOOK_ACCESS_TOKEN",
     "FACEBOOK_STREAM_KEY",
     "TIKTOK_STREAM_KEY",
+    "CUSTOM_STREAM_KEY",
     "GEMINI_API_KEY",
 )
 CONFIG_KEYS = (
@@ -71,6 +72,8 @@ CONFIG_KEYS = (
     "FACEBOOK_TARGET_ID",
     "FACEBOOK_GRAPH_VERSION",
     "TIKTOK_RTMP_URL",
+    "CUSTOM_RTMP_URL",
+    "CUSTOM_RTMP_NAME",
     "GEMINI_MODEL",
     "GEMINI_METADATA_ENABLED",
     "METADATA_LANGUAGE",
@@ -124,6 +127,8 @@ def _default_value(key: str) -> str:
         "FACEBOOK_TARGET_ID": "me",
         "FACEBOOK_GRAPH_VERSION": "v26.0",
         "TIKTOK_RTMP_URL": "rtmp://rtmp-push.tiktok.com/live",
+        "CUSTOM_RTMP_URL": "rtmp://live.restream.io/live",
+        "CUSTOM_RTMP_NAME": "Restream",
         "GEMINI_MODEL": "gemini-3.8-flash",
         "GEMINI_METADATA_ENABLED": "true",
         "METADATA_LANGUAGE": "ar",
@@ -328,6 +333,15 @@ class DashboardController:
                 missing.append(
                     "للبث إلى TikTok، أنشئ البث على TikTok وأضف رابط خادم RTMP ومفتاح البث للجلسة."
                 )
+        if "custom" in platforms:
+            if values.get("CUSTOM_STREAM_KEY", "").strip():
+                notes.append(
+                    "جسر RTMP مخصص (Restream): يُدفع البث مرة واحدة إلى Restream، فينشئ Restream بث TikTok تلقائياً دون مفتاح جلسة — فعّل قناة TikTok في Restream أولاً."
+                )
+            else:
+                missing.append(
+                    "للبث عبر جسر RTMP مخصص، أضف مفتاح بث Restream الدائم (رابط RTMP ومفتاح البث من إعدادات Restream)."
+                )
         gemini_enabled = _as_bool(values.get("GEMINI_METADATA_ENABLED", "true"))
         gemini_key_set = bool(values.get("GEMINI_API_KEY", "").strip())
         if gemini_enabled and metadata_api_enabled and not gemini_key_set:
@@ -432,6 +446,15 @@ class DashboardController:
             "tiktok_static_key_set": bool(
                 values.get("TIKTOK_STREAM_KEY", "").strip()
             ),
+            "custom_rtmp_url": values.get(
+                "CUSTOM_RTMP_URL", _default_value("CUSTOM_RTMP_URL")
+            ),
+            "custom_rtmp_name": values.get(
+                "CUSTOM_RTMP_NAME", _default_value("CUSTOM_RTMP_NAME")
+            ),
+            "custom_stream_key_set": bool(
+                values.get("CUSTOM_STREAM_KEY", "").strip()
+            ),
             "facebook_token_age_days": self._facebook_token_age_days(values),
             "facebook_token_stale": self._facebook_token_stale(values),
             "initial_profile": values.get("INITIAL_PROFILE", "720p"),
@@ -489,9 +512,12 @@ class DashboardController:
                 if part.strip()
             ]
             if not platforms or any(
-                item not in {"youtube", "facebook", "tiktok"} for item in platforms
+                item not in {"youtube", "facebook", "tiktok", "custom"}
+                for item in platforms
             ):
-                raise ValueError("Choose YouTube, Facebook, TikTok, or any of them")
+                raise ValueError(
+                    "Choose YouTube, Facebook, TikTok, Custom RTMP, or any of them"
+                )
             if "YOUTUBE_MODE" in updates and updates["YOUTUBE_MODE"] not in {
                 "auto",
                 "api",
@@ -632,6 +658,16 @@ class DashboardController:
                     raise ValueError(
                         "TIKTOK_RTMP_URL must be an RTMP URL, for example "
                         "rtmp://rtmp-push.tiktok.com/live"
+                    )
+            if "CUSTOM_RTMP_URL" in updates and updates["CUSTOM_RTMP_URL"]:
+                parsed_custom = urlsplit(updates["CUSTOM_RTMP_URL"])
+                if (
+                    parsed_custom.scheme not in {"rtmp", "rtmps"}
+                    or not parsed_custom.hostname
+                ):
+                    raise ValueError(
+                        "CUSTOM_RTMP_URL must be an RTMP URL, for example "
+                        "rtmp://live.restream.io/live"
                     )
             if "FFMPEG_PRESET" in updates and updates["FFMPEG_PRESET"] not in {
                 "ultrafast",
@@ -1226,6 +1262,7 @@ class DashboardController:
                 getattr(settings, "facebook_access_token", ""),
                 getattr(settings, "facebook_static_key", ""),
                 getattr(settings, "tiktok_static_key", ""),
+                getattr(settings, "custom_stream_key", ""),
             ):
                 if secret:
                     message = message.replace(secret, "[secret hidden]")

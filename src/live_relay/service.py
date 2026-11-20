@@ -159,7 +159,12 @@ def _destination_status(
     active_platforms: list[str] | None = None,
     failures: dict[str, str] | None = None,
 ) -> tuple[str, str]:
-    labels = {"youtube": "YouTube", "facebook": "Facebook", "tiktok": "TikTok"}
+    labels = {
+        "youtube": "YouTube",
+        "facebook": "Facebook",
+        "tiktok": "TikTok",
+        "custom": "RTMP مخصص",
+    }
     active_platforms = (
         session.active_platforms if active_platforms is None else active_platforms
     )
@@ -246,6 +251,12 @@ def _transport_failure_reason(platform: str) -> str:
             "TikTok RTMP connection failed; the stream key is issued per "
             "live session and expires, so create a new live on TikTok and "
             "paste its fresh Server URL and stream key, then restart"
+        )
+    if platform == "custom":
+        return (
+            "Custom RTMP connection failed; verify the Restream RTMP URL "
+            "and stream key, and that the bridged channel (e.g. TikTok) "
+            "is enabled in Restream"
         )
     if platform == "youtube":
         return (

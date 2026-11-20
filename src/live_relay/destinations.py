@@ -799,6 +799,20 @@ def open_destinations(
             session.failures["tiktok"] = (
                 "TikTok has no RTMP server URL or stream key configured"
             )
+    if "custom" in settings.platforms:
+        if settings.custom_rtmp_url and settings.custom_stream_key:
+            base = settings.custom_rtmp_url.rstrip("/")
+            session.targets.append(
+                ("custom", f"{base}/{settings.custom_stream_key}")
+            )
+            logging.warning(
+                "Custom RTMP mode cannot create live videos or "
+                "synchronize titles on the bridged platforms"
+            )
+        else:
+            session.failures["custom"] = (
+                "Custom RTMP has no server URL or stream key configured"
+            )
     if not session.targets:
         details = "; ".join(
             f"{name}: {error}" for name, error in session.failures.items()

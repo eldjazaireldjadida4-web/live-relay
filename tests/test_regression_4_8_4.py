@@ -147,11 +147,20 @@ class DashboardBadValuesTests(unittest.TestCase):
             self.assertEqual(config["logo_size_percent"], 12)
             self.assertEqual(config["logo_opacity"], 0.9)
             json.dumps(config)  # must not raise (NaN is not valid JSON)
-            self.assertTrue(
+            # 4.8.9: a fallback notice is a warning, not a blocker —
+            # ``missing`` blocks start_relay, so the notice lives in
+            # ``notes`` now.
+            self.assertFalse(
                 any("LOGO_SIZE_PERCENT" in note for note in config["missing"])
             )
-            self.assertTrue(
+            self.assertFalse(
                 any("LOGO_OPACITY" in note for note in config["missing"])
+            )
+            self.assertTrue(
+                any("LOGO_SIZE_PERCENT" in note for note in config["notes"])
+            )
+            self.assertTrue(
+                any("LOGO_OPACITY" in note for note in config["notes"])
             )
 
     def test_config_endpoint_answers_200_with_bad_logo_values(self):

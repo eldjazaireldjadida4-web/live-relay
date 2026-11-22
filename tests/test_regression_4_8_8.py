@@ -228,7 +228,7 @@ class YouTubeQuotaTrackerTests(unittest.TestCase):
             settings = load_settings()
         self.assertEqual(settings.youtube_quota_budget, 10000)
 
-    def test_quota_budget_rejects_a_non_numeric_value(self):
+    def test_quota_budget_falls_back_on_a_non_numeric_value(self):
         env = {
             "LIVE_PLATFORMS": "youtube,facebook",
             "YOUTUBE_STREAM_KEY": "dummy-key",
@@ -236,8 +236,10 @@ class YouTubeQuotaTrackerTests(unittest.TestCase):
             "YOUTUBE_QUOTA_BUDGET": "abc",
         }
         with patch.dict(os.environ, env, clear=True):
-            with self.assertRaisesRegex(ValueError, "YOUTUBE_QUOTA_BUDGET"):
-                load_settings()
+            settings = load_settings()
+        # 4.8.9: a hand-edited bad value must not brick startup; the
+        # dashboard already fell back to 10000 for display.
+        self.assertEqual(settings.youtube_quota_budget, 10000)
 
 
 # ---------------------------------------------------------------------------

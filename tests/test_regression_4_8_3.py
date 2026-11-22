@@ -166,11 +166,13 @@ class ApiAuthHttpTests(unittest.TestCase):
             )
             self.assertEqual(allowed.status_code, 200, path)
 
-    def test_dashboard_page_is_still_public_and_sends_the_token_on_get(self):
+    def test_dashboard_page_is_still_public_and_sends_a_session_token_on_get(self):
         response = requests.get(f"{self.base_url()}/", timeout=5)
         self.assertEqual(response.status_code, 200)
-        self.assertIn(self.controller.control_token, response.text)
-        self.assertIn('headers:{"X-Relay-Token":CONTROL_TOKEN}', response.text)
+        # M2: the page is still public, but it now sends a page-scoped
+        # session token instead of the real control token.
+        self.assertNotIn(self.controller.control_token, response.text)
+        self.assertIn('headers:{"X-Relay-Token":SESSION_TOKEN}', response.text)
 
     def test_unknown_route_still_returns_404_without_a_token(self):
         response = requests.get(f"{self.base_url()}/nope", timeout=5)

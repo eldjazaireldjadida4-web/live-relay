@@ -495,10 +495,13 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(status["title"], "عنوان مباشر مخصص")
         self.assertTrue(status["metadata_manual"])
 
-    def test_dashboard_page_embeds_the_control_token(self):
+    def test_dashboard_page_embeds_a_session_token_not_the_control_token(self):
         response = requests.get(f"{self.base_url()}/", timeout=5)
         self.assertEqual(response.status_code, 200)
-        self.assertIn(self.controller.control_token, response.text)
+        # M2: the served page must never carry the real control token;
+        # any local process reading the page would otherwise own the
+        # dashboard. It carries a page-scoped session token instead.
+        self.assertNotIn(self.controller.control_token, response.text)
         self.assertIn('id="gemini-key"', response.text)
         self.assertIn('id="logo-enabled"', response.text)
         self.assertIn('id="metadata-preview"', response.text)

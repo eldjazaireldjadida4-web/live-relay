@@ -324,12 +324,13 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
     try:
         logo_size_percent = int(os.getenv("LOGO_SIZE_PERCENT", "12"))
         logo_opacity = float(os.getenv("LOGO_OPACITY", "0.9"))
-    except ValueError as exc:
-        raise ValueError("LOGO_SIZE_PERCENT and LOGO_OPACITY must be numeric") from exc
-    if not 5 <= logo_size_percent <= 25:
-        raise ValueError("LOGO_SIZE_PERCENT must be between 5 and 25")
-    if not 0.1 <= logo_opacity <= 1.0:
-        raise ValueError("LOGO_OPACITY must be between 0.1 and 1")
+    except ValueError:
+        # A hand-edited bad value must not brick startup: fall back to
+        # the defaults, exactly like the dashboard does for display.
+        logo_size_percent = 12
+        logo_opacity = 0.9
+    logo_size_percent = min(25, max(5, logo_size_percent))
+    logo_opacity = min(1.0, max(0.1, logo_opacity))
     if logo_enabled and not logo_file.is_file():
         raise ValueError("LOGO_FILE does not point to an existing image")
     frame_enabled = _flag("FRAME_ENABLED", False)
@@ -353,8 +354,10 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
     record_enabled = _flag("RECORD_ENABLED")
     try:
         youtube_quota_budget = int(os.getenv("YOUTUBE_QUOTA_BUDGET", "10000"))
-    except ValueError as exc:
-        raise ValueError("YOUTUBE_QUOTA_BUDGET must be a whole number") from exc
+    except ValueError:
+        # A hand-edited bad value must not brick startup: fall back to
+        # the YouTube daily quota, like the dashboard does for display.
+        youtube_quota_budget = 10000
     try:
         reconnect_delay = int(os.getenv("RECONNECT_DELAY", "5"))
         source_retry = int(os.getenv("SOURCE_RETRY", "30"))

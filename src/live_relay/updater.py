@@ -401,6 +401,10 @@ def verify_manifest(content_root: Path, version: str) -> bool:
         relative = found.relative_to(content_root)
         if relative.name == MANIFEST_FILENAME or _is_preserved(relative):
             continue
+        # The manifest generator deliberately omits some files (caches,
+        # .DS_Store); those must not fail the update as "unlisted".
+        if _manifest_excluded(relative):
+            continue
         if relative.as_posix() not in expected:
             raise ValueError(
                 f"Update contains unlisted file {relative.as_posix()}"
@@ -606,6 +610,7 @@ def apply_pending_update(project_root: Path, state_dir: Path) -> str | None:
             # trusting the zip contents alone. A tree without one (an
             # older release) keeps the previous checks.
             verify_manifest(content_root, version)
+            copied: list[str] = []
             for source in sorted(content_root.rglob("*")):
                 if not source.is_file():
                     continue
@@ -620,6 +625,7 @@ def apply_pending_update(project_root: Path, state_dir: Path) -> str | None:
                 except ValueError:
                     pass
                 _copy_file_atomic(source, target)
+                copied.append(relative.as_posix())
                 member = f"{prefix}{relative.as_posix()}" if prefix else relative.as_posix()
                 recorded = zip_modes.get(member, 0)
                 if recorded & 0o111:
@@ -628,6 +634,44 @@ def apply_pending_update(project_root: Path, state_dir: Path) -> str | None:
                         os.chmod(target, current | (recorded & 0o111))
                     except OSError:
                         pass
+            # Files the updater installed before but this release no
+            # longer ships would otherwise stay on disk (and stay
+            # importable) forever. Remove only files the updater
+            # itself previously installed: user files and preserved
+            # files are never touched, and an install without a
+            # recorded list removes nothing.
+            previous = {
+                str(item)
+                for item in state.get("applied_files") or []
+                if isinstance(item, str)
+            }
+            for stale in sorted(previous - set(copied)):
+                relative = Path(stale)
+                if relative.is_absolute() or ".." in relative.parts:
+                    continue
+                if _is_preserved(relative):
+                    continue
+                target = project_root / relative
+                try:
+                    resolved = target.resolve()
+                except OSError:
+                    continue
+                # Only ever delete inside the project root, and never
+                # inside the state directory.
+                if not resolved.is_relative_to(
+                    project_root
+                ) or resolved.is_relative_to(state_dir.resolve()):
+                    continue
+                try:
+                    resolved.unlink()
+                    logging.info("Removed stale file from a previous release: %s", stale)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logging.warning(
+                        "Could not remove stale file %s: %s", stale, exc
+                    )
+            state["applied_files"] = sorted(copied)
     state.pop("staged", None)
     state["last_applied_version"] = version
     state["last_applied_at"] = time.time()

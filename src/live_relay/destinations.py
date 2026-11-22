@@ -35,7 +35,13 @@ YOUTUBE_HTTP_TIMEOUT_SECONDS = 30
 # burn more than half of it in a day. The tracker below stretches the
 # probe interval as the budget runs out, and stops polling entirely
 # once it is spent; usage resets at midnight UTC.
-YOUTUBE_STATUS_CHECK_COST = 2
+# Published YouTube Data API quota costs (units per call): list/read
+# calls cost 1, inserts, binds, transitions, updates and thumbnail
+# sets cost 50. Every call is recorded, not just the probes: a session
+# start alone costs ~250 units, and counting only the probes would
+# report budget remaining long after the real daily quota is spent.
+YOUTUBE_QUOTA_COST_LIST = 1
+YOUTUBE_QUOTA_COST_WRITE = 50
 YOUTUBE_DAILY_QUOTA_UNITS = 10_000
 YOUTUBE_QUOTA_SLOW_AT = 0.70
 YOUTUBE_QUOTA_SLOWER_AT = 0.85
@@ -304,12 +310,14 @@ class YouTubeDestination:
                 "YouTube authorization is missing or expired. Reconnect the account from the dashboard before starting."
             )
         service = _youtube_service(credentials)
-        channel_ids = {
-            item.get("id")
-            for item in service.channels()
+        items = (
+            service.channels()
             .list(part="id", mine=True)
             .execute()
-            .get("items", [])
+        )
+        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
+        channel_ids = {
+            item.get("id") for item in items.get("items", [])
         }
         if self.settings.youtube_channel_id not in channel_ids:
             raise RuntimeError(
@@ -329,8 +337,9 @@ class YouTubeDestination:
             service.channels()
             .list(part="id,snippet", mine=True)
             .execute()
-            .get("items", [])
         )
+        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
+        items = items.get("items", [])
         if not items:
             raise RuntimeError(
                 "YouTube did not return a channel for the saved authorization."
@@ -381,12 +390,14 @@ class YouTubeDestination:
             )
             .execute()
         )
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.stream = self._get_stream()
         self.service.liveBroadcasts().bind(
             part="id,contentDetails",
             id=self.broadcast["id"],
             streamId=self.stream["id"],
         ).execute()
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.metadata = metadata
         try:
             self._update_video_metadata(metadata)
@@ -434,20 +445,20 @@ class YouTubeDestination:
             .execute()
             .get("items", [])
         )
+        # Record each successful list separately: a probe whose first
+        # call succeeds and whose second fails still spent 1 unit.
+        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
         stream = (
             self.service.liveStreams()
             .list(part="status", id=self.stream["id"])
             .execute()
             .get("items", [])
         )
+        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
         if not broadcast or not stream:
             raise RuntimeError(
                 "YouTube no longer knows the broadcast or stream of this session."
             )
-        # A successful probe consumed quota; record it so the supervisor
-        # can stretch the polling interval before the daily budget runs
-        # out. A failed probe records nothing: no usable data came back.
-        self.quota.record(YOUTUBE_STATUS_CHECK_COST)
         result = {
             "broadcast_status": str(
                 (broadcast[0].get("status") or {}).get("lifeCycleStatus") or "unknown"
@@ -491,6 +502,7 @@ class YouTubeDestination:
                 _safe_error(exc),
             )
             return False
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         logging.info("YouTube broadcast transitioned to live")
         return True
 
@@ -509,6 +521,7 @@ class YouTubeDestination:
                     .execute()
                     .get("items", [])
                 )
+                self.quota.record(YOUTUBE_QUOTA_COST_LIST)
                 # Reuse only an idle saved stream. An "active" stream may still
                 # be fed by another encoder (or a previous process that has not
                 # timed out yet); reusing it would hijack that ingest, so an
@@ -541,6 +554,7 @@ class YouTubeDestination:
                 )
                 .execute()
             )
+            self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
             descriptor, temporary_path = tempfile.mkstemp(
                 prefix=".youtube-stream.", suffix=".tmp", dir=state_file.parent
             )
@@ -578,6 +592,7 @@ class YouTubeDestination:
                 },
             },
         ).execute()
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
 
 
     def update_thumbnail(self, image_path: Path) -> None:
@@ -593,6 +608,7 @@ class YouTubeDestination:
                 str(image_path), mimetype=mime_type, resumable=True
             ),
         ).execute()
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         logging.info("Custom YouTube thumbnail applied to the live video")
 
     def update_metadata(self, value: StreamMetadata | str) -> None:
@@ -620,6 +636,7 @@ class YouTubeDestination:
             )
             .execute()
         )
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.broadcast = updated
         self._update_video_metadata(metadata)
         self.metadata = metadata
@@ -635,6 +652,7 @@ class YouTubeDestination:
             self.service.liveBroadcasts().transition(
                 part="status", id=broadcast["id"], broadcastStatus="complete"
             ).execute()
+            self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
             logging.info("YouTube broadcast marked complete")
         except Exception as exc:
             logging.warning(

@@ -420,22 +420,25 @@ class DashboardController:
         # The logo numbers come from the raw .env and may be hand-edited
         # garbage (``LOGO_SIZE_PERCENT=abc``) or a non-JSON value such as
         # ``nan``. Never let one bad value break the whole config response:
-        # fall back to the defaults and say so in ``missing``.
+        # fall back to the defaults and say so in ``notes``. These are
+        # warnings, not blockers: ``start_relay`` refuses to start while
+        # ``missing`` is non-empty, so a fallback notice there would
+        # brick the relay over a value the dashboard already handles.
         try:
             logo_size_percent = int(values.get("LOGO_SIZE_PERCENT", "12"))
         except (TypeError, ValueError):
             logo_size_percent = 12
-            missing.append("LOGO_SIZE_PERCENT is not a number; using 12%.")
+            notes.append("LOGO_SIZE_PERCENT is not a number; using 12%.")
         if not 5 <= logo_size_percent <= 25:
-            missing.append("LOGO_SIZE_PERCENT must be between 5 and 25; using 12%.")
+            notes.append("LOGO_SIZE_PERCENT must be between 5 and 25; using 12%.")
             logo_size_percent = 12
         try:
             logo_opacity = float(values.get("LOGO_OPACITY", "0.9"))
         except (TypeError, ValueError):
             logo_opacity = 0.9
-            missing.append("LOGO_OPACITY is not a number; using 0.9.")
+            notes.append("LOGO_OPACITY is not a number; using 0.9.")
         if logo_opacity != logo_opacity or not 0.1 <= logo_opacity <= 1:
-            missing.append("LOGO_OPACITY must be between 0.1 and 1; using 0.9.")
+            notes.append("LOGO_OPACITY must be between 0.1 and 1; using 0.9.")
             logo_opacity = 0.9
         # Same guard as the logo numbers above: one bad quota value must
         # not break the whole config response.
@@ -448,7 +451,7 @@ class DashboardController:
             )
         except (TypeError, ValueError):
             youtube_quota_budget = 10000
-            missing.append("YOUTUBE_QUOTA_BUDGET is not a number; using 10000.")
+            notes.append("YOUTUBE_QUOTA_BUDGET is not a number; using 10000.")
         if youtube_quota_budget < 100:
             youtube_quota_budget = 100
         config = {
@@ -1038,23 +1041,22 @@ class DashboardController:
         return YouTubeDestination(settings).verify_access()
 
     def youtube_broadcast_status(self) -> dict[str, str]:
-        load_dotenv(self.env_path, override=True)
-        settings = load_settings(platforms_override=("youtube",))
-        if not settings.youtube_api_enabled:
+        """Live status of the YouTube broadcast this relay is running.
+
+        The status comes from the live session's own destination: a
+        freshly built destination has no broadcast or stream, so asking
+        it for a status could never succeed. When nothing is live (or
+        YouTube runs in static-key mode) the button reports that
+        plainly instead of a confusing API error.
+        """
+        session = self.status.destination_session
+        youtube = getattr(session, "youtube", None) if session is not None else None
+        if youtube is None:
             raise RuntimeError(
-                "Select YouTube API mode before checking the linked YouTube account."
+                "No YouTube API broadcast is active right now; start the "
+                "relay (YouTube API mode) to check its live status."
             )
-        if not settings.youtube_client_secrets:
-            raise RuntimeError(
-                "Select a Google OAuth JSON file before checking YouTube."
-            )
-        if not (settings.state_dir / "youtube-token.json").is_file():
-            raise ValueError(
-                "لم يتم ربط YouTube بعد على هذا الجهاز. اضغط «ربط YouTube» أولاً."
-            )
-        destination = YouTubeDestination(settings)
-        destination.authenticate(allow_browser=False)
-        return destination.check_status()
+        return youtube.check_status()
 
     def preflight(self) -> dict[str, Any]:
         load_dotenv(self.env_path, override=True)

@@ -33,10 +33,10 @@ class StreamMetadata:
 
 GEMINI_MAX_ATTEMPTS = 3
 GEMINI_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
-# HTTP statuses worth a second try: rate limiting and server-side
-# failures. Other 4xx errors (bad key, bad request) cannot succeed on
-# retry, so they fail immediately.
-_GEMINI_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+# HTTP statuses worth a second try: rate limiting, request timeouts
+# and server-side failures. Other 4xx errors (bad key, bad request)
+# cannot succeed on retry, so they fail immediately.
+_GEMINI_RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 
 
 def post_gemini(

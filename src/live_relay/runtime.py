@@ -41,6 +41,22 @@ class RelayStatus:
             self._data.update(values)
             self._data["updated_at"] = time.time()
 
+    def record_notification_failure(
+        self, failure: dict[str, Any], total: int
+    ) -> None:
+        """Append one failed delivery to the status, atomically.
+
+        The notifier calls this from its delivery threads; a
+        read-modify-write on ``snapshot()`` here would lose entries
+        when two deliveries fail at once.
+        """
+        with self._lock:
+            failures = list(self._data.get("notification_failures") or [])
+            failures.append(dict(failure))
+            self._data["notification_failures"] = failures[-5:]
+            self._data["notification_failure_count"] = total
+            self._data["updated_at"] = time.time()
+
     def set_destination_session(self, session: Any) -> None:
         with self._lock:
             self._destination_session = session

@@ -1096,12 +1096,7 @@ def run(
         # so the dashboard shows them next to the destination errors.
         if status is None:
             return
-        failures = list(status.snapshot().get("notification_failures") or [])
-        failures.append(failure)
-        status.update(
-            notification_failures=failures[-5:],
-            notification_failure_count=total,
-        )
+        status.record_notification_failure(failure, total)
 
     notifier = notifier_from_settings(
         settings, on_failure=_record_notification_failure

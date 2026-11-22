@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -201,6 +202,14 @@ def _stop_pipe_process(process: subprocess.Popen[bytes] | None) -> None:
         process.wait(timeout=5)
 
 
+# How many consecutive chunks a subscriber may refuse (its ffmpeg stdin
+# buffer full) before the pump drops it: a momentary stall must not
+# kill a healthy destination, but one wedged ffmpeg must never starve
+# the others. A dropped worker stalls, the supervisor restarts it, and
+# it re-subscribes with a fresh stdin.
+SHARED_PIPE_BLOCKED_DROP_AFTER = 10
+
+
 class SharedSourcePipe:
     """One yt-dlp process feeding every encoder worker.
 
@@ -219,6 +228,9 @@ class SharedSourcePipe:
         self._subscribers: set[Any] = set()
         self._lock = threading.Lock()
         self._stopped = threading.Event()
+        # Consecutive refused chunks per subscriber id; reset on every
+        # successful write.
+        self._blocked_counts: dict[int, int] = {}
 
     def start(self) -> bool:
         if self.alive():
@@ -256,14 +268,54 @@ class SharedSourcePipe:
     def subscribe(self, stream: Any) -> None:
         with self._lock:
             self._subscribers.add(stream)
+            self._blocked_counts.pop(id(stream), None)
+        # Writes go straight to the fd (see _pump_write), so make it
+        # non-blocking: a full ffmpeg stdin then refuses a chunk instead
+        # of wedging the pump thread for every other destination.
+        # Streams without a real fd (test doubles) keep the old path.
+        try:
+            os.set_blocking(stream.fileno(), False)
+        except (OSError, ValueError):
+            pass
 
     def unsubscribe(self, stream: Any) -> None:
         with self._lock:
             self._subscribers.discard(stream)
+            self._blocked_counts.pop(id(stream), None)
 
     def subscriber_count(self) -> int:
         with self._lock:
             return len(self._subscribers)
+
+    def _pump_write(self, subscriber: Any, chunk: bytes) -> bool | str:
+        """Feed one chunk to a subscriber.
+
+        Returns True when written, "blocked" when the subscriber's
+        stdin buffer is momentarily full, False when the subscriber is
+        dead and should be dropped. A partial write drops the tail of
+        the chunk: MPEG-TS resyncs on the next keyframe, so one slow
+        reader must not stall the rest.
+        """
+        try:
+            fd = subscriber.fileno()
+        except (OSError, ValueError):
+            fd = None
+        if fd is None:
+            # No real file descriptor (test doubles): blocking write,
+            # as before.
+            try:
+                subscriber.write(chunk)
+                subscriber.flush()
+            except (OSError, ValueError):
+                return False
+            return True
+        try:
+            os.write(fd, chunk)
+        except BlockingIOError:
+            return "blocked"
+        except (OSError, ValueError):
+            return False
+        return True
 
     def _pump_stdout(self) -> None:
         process = self._process
@@ -277,10 +329,23 @@ class SharedSourcePipe:
                 with self._lock:
                     subscribers = list(self._subscribers)
                 for subscriber in subscribers:
-                    try:
-                        subscriber.write(chunk)
-                        subscriber.flush()
-                    except (OSError, ValueError):
+                    outcome = self._pump_write(subscriber, chunk)
+                    if outcome is True:
+                        with self._lock:
+                            self._blocked_counts.pop(id(subscriber), None)
+                    elif outcome == "blocked":
+                        with self._lock:
+                            count = self._blocked_counts.get(id(subscriber), 0) + 1
+                            self._blocked_counts[id(subscriber)] = count
+                        if count >= SHARED_PIPE_BLOCKED_DROP_AFTER:
+                            logging.warning(
+                                "Shared yt-dlp pipe: dropping a subscriber "
+                                "whose input stayed full for %d chunks; "
+                                "its worker will restart and re-subscribe",
+                                count,
+                            )
+                            self.unsubscribe(subscriber)
+                    else:
                         self.unsubscribe(subscriber)
         except (OSError, ValueError):
             pass

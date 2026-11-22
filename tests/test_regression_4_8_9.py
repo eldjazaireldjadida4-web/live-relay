@@ -179,9 +179,10 @@ class YouTubeQuotaCostsTests(unittest.TestCase):
         destination.stream = {"id": "stream-id"}
         with self.assertRaises(RuntimeError):
             destination.check_status()
-        # The broadcast list succeeded and was counted before the
-        # streams list failed; the old code recorded nothing at all.
-        self.assertEqual(destination.quota.used, 1)
+        # Both lists were attempted, so both cost 1 unit: YouTube
+        # charges for failed calls too, and the old code (which only
+        # counted successes) under-reported the real spend.
+        self.assertEqual(destination.quota.used, 2)
 
     def test_ensure_live_records_the_transition(self):
         destination = YouTubeDestination(SimpleNamespace(youtube_quota_budget=10000))
@@ -487,23 +488,34 @@ class BadValueFallbackTests(unittest.TestCase):
         self.assertEqual(settings.logo_size_percent, 12)
         self.assertEqual(settings.logo_opacity, 0.9)
 
-    def test_load_settings_clamps_out_of_range_logo_values(self):
+    def test_load_settings_falls_back_on_out_of_range_logo_values(self):
+        # Out-of-range values fall back to the defaults the dashboard
+        # reports (12% / 0.9), instead of clamping to the boundary:
+        # the displayed settings must match what the encoder uses.
         with patch.dict(
             os.environ,
             self._env(LOGO_SIZE_PERCENT="99", LOGO_OPACITY="5"),
             clear=True,
         ):
             settings = load_settings()
-        self.assertEqual(settings.logo_size_percent, 25)
-        self.assertEqual(settings.logo_opacity, 1.0)
+        self.assertEqual(settings.logo_size_percent, 12)
+        self.assertEqual(settings.logo_opacity, 0.9)
         with patch.dict(
             os.environ,
             self._env(LOGO_SIZE_PERCENT="1", LOGO_OPACITY="0.01"),
             clear=True,
         ):
             settings = load_settings()
-        self.assertEqual(settings.logo_size_percent, 5)
-        self.assertEqual(settings.logo_opacity, 0.1)
+        self.assertEqual(settings.logo_size_percent, 12)
+        self.assertEqual(settings.logo_opacity, 0.9)
+        with patch.dict(
+            os.environ,
+            self._env(LOGO_SIZE_PERCENT="nan", LOGO_OPACITY="nan"),
+            clear=True,
+        ):
+            settings = load_settings()
+        self.assertEqual(settings.logo_size_percent, 12)
+        self.assertEqual(settings.logo_opacity, 0.9)
 
     def test_load_settings_falls_back_on_a_non_numeric_quota_budget(self):
         with patch.dict(os.environ, self._env(YOUTUBE_QUOTA_BUDGET="abc"), clear=True):

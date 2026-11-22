@@ -1185,12 +1185,15 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(settings.effective_youtube_mode, "api")
         self.assertTrue(settings.youtube_api_enabled)
 
-    def test_invalid_boolean_setting_is_rejected(self):
-        with (
-            patch.dict(os.environ, self.base_env(YOUTUBE_BACKUP="maybe"), clear=True),
-            self.assertRaisesRegex(ValueError, "YOUTUBE_BACKUP"),
+    def test_invalid_boolean_setting_falls_back_to_its_default(self):
+        # A hand-edited garbage boolean falls back (with a warning)
+        # instead of bricking startup, like the numeric fallbacks; the
+        # dashboard still rejects garbage booleans at save time.
+        with patch.dict(
+            os.environ, self.base_env(YOUTUBE_BACKUP="maybe"), clear=True
         ):
-            load_settings()
+            settings = load_settings()
+        self.assertFalse(settings.youtube_backup)
 
     def test_youtube_static_mode_overrides_linked_oauth(self):
         settings = SimpleNamespace(

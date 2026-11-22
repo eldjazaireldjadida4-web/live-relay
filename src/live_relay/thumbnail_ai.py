@@ -48,7 +48,8 @@ def _image_from_steps(payload: dict[str, Any]) -> bytes | None:
                 try:
                     return base64.b64decode(data, validate=True)
                 except (ValueError, TypeError):
-                    return None
+                    # One corrupt image item must not discard the rest.
+                    continue
     return None
 
 

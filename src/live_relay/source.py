@@ -293,8 +293,11 @@ class SharedSourcePipe:
         Returns True when written, "blocked" when the subscriber's
         stdin buffer is momentarily full, False when the subscriber is
         dead and should be dropped. A partial write drops the tail of
-        the chunk: MPEG-TS resyncs on the next keyframe, so one slow
-        reader must not stall the rest.
+        the chunk (MPEG-TS resyncs on the next keyframe) but counts as
+        blocked: a reader that only ever accepts part of each chunk is
+        falling behind just like one that accepts nothing, and must
+        reach the drop threshold instead of receiving truncated chunks
+        forever.
         """
         try:
             fd = subscriber.fileno()
@@ -310,11 +313,13 @@ class SharedSourcePipe:
                 return False
             return True
         try:
-            os.write(fd, chunk)
+            written = os.write(fd, chunk)
         except BlockingIOError:
             return "blocked"
         except (OSError, ValueError):
             return False
+        if written < len(chunk):
+            return "blocked"
         return True
 
     def _pump_stdout(self) -> None:

@@ -164,6 +164,10 @@ class DashboardController:
         self.env_path = self.project_root / ".env"
         self.example_path = self.project_root / ".env.example"
         self._lock = threading.RLock()
+        # Serializes update downloads only: the network fetch must not
+        # hold the controller lock (see check_for_updates), but two
+        # concurrent downloads would write the same zip file at once.
+        self._download_lock = threading.Lock()
         self._relay_thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
         self.status = RelayStatus()
@@ -976,7 +980,6 @@ class DashboardController:
         thumbnail_path, info = save_thumbnail(state_dir, data)
         set_manual_hold(state_dir, True)
         self.status.update(thumbnail_provider="manual")
-        set_manual_hold(state_dir, True)
         session = self.status.destination_session if self._is_running() else None
         results = (
             update_destination_thumbnail(session, thumbnail_path) if session else {}
@@ -1195,6 +1198,10 @@ class DashboardController:
         Only *reports* an available update. Nothing is downloaded here.
         Returns the update status plus ``checked`` and a ``reason`` when
         the check was skipped (``disabled``, ``no_repo``, ``throttled``).
+
+        The network fetch runs outside the controller lock: holding it
+        across a 10 s fetch stalled stop/save/start for the whole
+        request. Only the state read and the state write take the lock.
         """
         with self._lock:
             status = self.update_status()
@@ -1205,19 +1212,28 @@ class DashboardController:
             state_dir = self._update_state_dir()
             if not force and not updater.due_for_check(state_dir):
                 return {**status, "checked": False, "reason": "throttled"}
-            release = updater.fetch_latest_release(status["repo"])
-            if release is None:
-                # A failed check must not wipe the previously known latest
-                # release, and must not consume the day's throttle: the
-                # update stays visible and the next check is not delayed.
-                return {**status, "checked": False, "reason": "fetch_failed"}
+            repo = status["repo"]
+        release = updater.fetch_latest_release(repo)
+        if release is None:
+            # A failed check must not wipe the previously known latest
+            # release, and must not consume the day's throttle: the
+            # update stays visible and the next check is not delayed.
+            return {**self.update_status(), "checked": False, "reason": "fetch_failed"}
+        with self._lock:
             updater.write_update_state(
                 state_dir, last_check=time.time(), latest=release
             )
             return {**self.update_status(), "checked": True}
 
     def download_update(self) -> dict[str, Any]:
-        """Download the latest release zip and stage it for the next start."""
+        """Download the latest release zip and stage it for the next start.
+
+        The download runs outside the controller lock: holding it
+        across a download (up to 120 s) blocked stop/save/start for
+        the whole transfer. A dedicated download lock serializes
+        concurrent downloads, which would otherwise write the same zip
+        file from two threads at once.
+        """
         with self._lock:
             status = self.update_status()
             if not status["configured"]:
@@ -1226,26 +1242,36 @@ class DashboardController:
                     "then check for updates"
                 )
             latest = status["latest"]
-            if not latest or not updater.is_newer(
-                str(latest.get("version") or ""), __version__
-            ):
-                latest = self.check_for_updates(force=True).get("latest")
-            if not latest or not updater.is_newer(
-                str(latest.get("version") or ""), __version__
-            ):
-                raise RuntimeError("No newer release is available to download")
-            zipball_url = str(latest.get("zipball_url") or "")
-            if not zipball_url:
-                raise RuntimeError("The latest release has no downloadable archive")
-            state_dir = self._update_state_dir()
-            zip_path = (
-                state_dir
-                / "updates"
-                / f"live-relay-{latest['version']}.zip"
+            newer = bool(
+                latest
+                and updater.is_newer(
+                    str(latest.get("version") or ""), __version__
+                )
             )
+        if not newer:
+            latest = self.check_for_updates(force=True).get("latest")
+            newer = bool(
+                latest
+                and updater.is_newer(
+                    str(latest.get("version") or ""), __version__
+                )
+            )
+        if not newer or not latest:
+            raise RuntimeError("No newer release is available to download")
+        zipball_url = str(latest.get("zipball_url") or "")
+        if not zipball_url:
+            raise RuntimeError("The latest release has no downloadable archive")
+        state_dir = self._update_state_dir()
+        zip_path = (
+            state_dir
+            / "updates"
+            / f"live-relay-{latest['version']}.zip"
+        )
+        with self._download_lock:
             updater.download_release_zip(zipball_url, zip_path)
-            updater.stage_update(state_dir, latest, zip_path)
-            return self.update_status()
+            with self._lock:
+                updater.stage_update(state_dir, latest, zip_path)
+                return self.update_status()
 
     def install_update(self) -> dict[str, Any]:
         """Stage the update (downloading it first if needed) and restart.
@@ -1257,12 +1283,12 @@ class DashboardController:
         with self._lock:
             if self._is_running():
                 raise RuntimeError("Stop the relay before installing an update")
-            status = self.update_status()
-            if not status["staged"]:
-                status = self.download_update()
-            staged = status["staged"]
-            if not staged:
-                raise RuntimeError("No update is staged to install")
+            staged = self.update_status()["staged"]
+        if not staged:
+            staged = self.download_update()["staged"]
+        if not staged:
+            raise RuntimeError("No update is staged to install")
+        with self._lock:
             self.update_restart_requested = True
             if self._shutdown_callback is not None:
                 threading.Timer(0.5, self._shutdown_callback).start()

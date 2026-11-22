@@ -49,12 +49,19 @@ YOUTUBE_QUOTA_CRITICAL_AT = 0.95
 
 
 class YouTubeQuotaTracker:
-    """Daily YouTube Data API quota usage for status polling."""
+    """Daily YouTube Data API quota usage for status polling.
+
+    The tracker is read from the dashboard status thread while the
+    supervision thread records calls, so every mutation and read is
+    guarded: an unlocked read-modify-write lost counts under
+    concurrent recording.
+    """
 
     def __init__(self, budget: int = YOUTUBE_DAILY_QUOTA_UNITS) -> None:
         self.budget = max(1, int(budget))
         self.used = 0
         self._day = self._today()
+        self._lock = threading.RLock()
 
     @staticmethod
     def _today() -> str:
@@ -67,18 +74,21 @@ class YouTubeQuotaTracker:
             self.used = 0
 
     def record(self, units: int) -> None:
-        self._rollover()
-        self.used += max(0, int(units))
+        with self._lock:
+            self._rollover()
+            self.used += max(0, int(units))
 
     @property
     def used_fraction(self) -> float:
-        self._rollover()
-        return min(1.0, self.used / self.budget)
+        with self._lock:
+            self._rollover()
+            return min(1.0, self.used / self.budget)
 
     @property
     def remaining(self) -> int:
-        self._rollover()
-        return max(0, self.budget - self.used)
+        with self._lock:
+            self._rollover()
+            return max(0, self.budget - self.used)
 
     def can_poll(self) -> bool:
         """False once the daily budget is spent; polling resumes tomorrow."""
@@ -99,13 +109,14 @@ class YouTubeQuotaTracker:
         return float(base_seconds) * factor
 
     def snapshot(self) -> dict[str, Any]:
-        self._rollover()
-        return {
-            "used": self.used,
-            "budget": self.budget,
-            "remaining": self.remaining,
-            "used_fraction": round(self.used_fraction, 3),
-        }
+        with self._lock:
+            self._rollover()
+            return {
+                "used": self.used,
+                "budget": self.budget,
+                "remaining": self.remaining,
+                "used_fraction": round(self.used_fraction, 3),
+            }
 
 
 def _youtube_service(credentials: Any):
@@ -310,12 +321,15 @@ class YouTubeDestination:
                 "YouTube authorization is missing or expired. Reconnect the account from the dashboard before starting."
             )
         service = _youtube_service(credentials)
+        # YouTube charges quota for attempted calls, failed ones
+        # included, so record before the call, not after its success:
+        # recording only successes under-reported the real spend.
+        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
         items = (
             service.channels()
             .list(part="id", mine=True)
             .execute()
         )
-        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
         channel_ids = {
             item.get("id") for item in items.get("items", [])
         }
@@ -333,12 +347,12 @@ class YouTubeDestination:
                 "No valid YouTube authorization is saved on this device; press 'ربط YouTube' once before checking."
             )
         service = _youtube_service(credentials)
+        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
         items = (
             service.channels()
             .list(part="id,snippet", mine=True)
             .execute()
         )
-        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
         items = items.get("items", [])
         if not items:
             raise RuntimeError(
@@ -366,6 +380,7 @@ class YouTubeDestination:
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z")
         )
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.broadcast = (
             self.service.liveBroadcasts()
             .insert(
@@ -390,14 +405,13 @@ class YouTubeDestination:
             )
             .execute()
         )
-        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.stream = self._get_stream()
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.service.liveBroadcasts().bind(
             part="id,contentDetails",
             id=self.broadcast["id"],
             streamId=self.stream["id"],
         ).execute()
-        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.metadata = metadata
         try:
             self._update_video_metadata(metadata)
@@ -439,14 +453,16 @@ class YouTubeDestination:
         """Read-only probe of what YouTube itself says about the broadcast and stream."""
         if not self.service or not self.broadcast or not self.stream:
             raise RuntimeError("No YouTube broadcast is open in this session yet.")
+        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
         broadcast = (
             self.service.liveBroadcasts()
             .list(part="status", id=self.broadcast["id"])
             .execute()
             .get("items", [])
         )
-        # Record each successful list separately: a probe whose first
-        # call succeeds and whose second fails still spent 1 unit.
+        # Record each attempted list separately: a probe whose first
+        # call succeeds and whose second fails still spent 1 unit on
+        # the first, and a failed first call spent 1 unit too.
         self.quota.record(YOUTUBE_QUOTA_COST_LIST)
         stream = (
             self.service.liveStreams()
@@ -454,7 +470,6 @@ class YouTubeDestination:
             .execute()
             .get("items", [])
         )
-        self.quota.record(YOUTUBE_QUOTA_COST_LIST)
         if not broadcast or not stream:
             raise RuntimeError(
                 "YouTube no longer knows the broadcast or stream of this session."
@@ -491,6 +506,7 @@ class YouTubeDestination:
         if not self.service or not self.broadcast:
             return False
         try:
+            self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
             self.service.liveBroadcasts().transition(
                 part="status",
                 id=self.broadcast["id"],
@@ -502,7 +518,6 @@ class YouTubeDestination:
                 _safe_error(exc),
             )
             return False
-        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         logging.info("YouTube broadcast transitioned to live")
         return True
 
@@ -515,13 +530,13 @@ class YouTubeDestination:
                 "stream_id"
             )
             if stream_id:
+                self.quota.record(YOUTUBE_QUOTA_COST_LIST)
                 items = (
                     self.service.liveStreams()
                     .list(part="cdn,contentDetails,status", id=stream_id)
                     .execute()
                     .get("items", [])
                 )
-                self.quota.record(YOUTUBE_QUOTA_COST_LIST)
                 # Reuse only an idle saved stream. An "active" stream may still
                 # be fed by another encoder (or a previous process that has not
                 # timed out yet); reusing it would hijack that ingest, so an
@@ -535,9 +550,16 @@ class YouTubeDestination:
                     "inactive",
                 }:
                     stream = items[0]
-        except (OSError, ValueError, AttributeError, TypeError):
+        except Exception:
+            # A failed lookup must not kill the whole start: the saved
+            # stream may be gone, or the API call itself may have
+            # failed (an HttpError is none of the types the old
+            # except clause listed). Minting a fresh stream is the
+            # safe fallback; the insert below still raises if the API
+            # is really unreachable.
             stream = None
         if stream is None:
+            self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
             stream = (
                 self.service.liveStreams()
                 .insert(
@@ -554,7 +576,6 @@ class YouTubeDestination:
                 )
                 .execute()
             )
-            self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
             descriptor, temporary_path = tempfile.mkstemp(
                 prefix=".youtube-stream.", suffix=".tmp", dir=state_file.parent
             )
@@ -580,6 +601,7 @@ class YouTubeDestination:
         return stream
 
     def _update_video_metadata(self, metadata: StreamMetadata) -> None:
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.service.videos().update(
             part="snippet",
             body={
@@ -592,7 +614,6 @@ class YouTubeDestination:
                 },
             },
         ).execute()
-        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
 
 
     def update_thumbnail(self, image_path: Path) -> None:
@@ -602,13 +623,13 @@ class YouTubeDestination:
         if not image_path.is_file():
             raise ValueError("The saved YouTube thumbnail file is missing")
         mime_type = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.service.thumbnails().set(
             videoId=self.broadcast["id"],
             media_body=MediaFileUpload(
                 str(image_path), mimetype=mime_type, resumable=True
             ),
         ).execute()
-        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         logging.info("Custom YouTube thumbnail applied to the live video")
 
     def update_metadata(self, value: StreamMetadata | str) -> None:
@@ -628,6 +649,7 @@ class YouTubeDestination:
                 "categoryId": metadata.category_id,
             }
         )
+        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         updated = (
             self.service.liveBroadcasts()
             .update(
@@ -636,7 +658,6 @@ class YouTubeDestination:
             )
             .execute()
         )
-        self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
         self.broadcast = updated
         self._update_video_metadata(metadata)
         self.metadata = metadata
@@ -649,10 +670,10 @@ class YouTubeDestination:
         if not broadcast or not self.service:
             return
         try:
+            self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
             self.service.liveBroadcasts().transition(
                 part="status", id=broadcast["id"], broadcastStatus="complete"
             ).execute()
-            self.quota.record(YOUTUBE_QUOTA_COST_WRITE)
             logging.info("YouTube broadcast marked complete")
         except Exception as exc:
             logging.warning(

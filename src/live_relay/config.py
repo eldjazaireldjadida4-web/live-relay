@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -141,7 +142,12 @@ def _flag(name: str, default: bool = False) -> bool:
         return True
     if value in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(f"{name} must be a boolean value")
+    # A hand-edited bad value must not brick startup (same rule as the
+    # numeric fallbacks below): warn and use the default. The dashboard
+    # still rejects garbage booleans strictly at save time, so this
+    # only forgives values edited into .env by hand.
+    logging.warning("%s is not a boolean value; using %s", name, default)
+    return default
 
 
 def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings:
@@ -329,8 +335,16 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
         # the defaults, exactly like the dashboard does for display.
         logo_size_percent = 12
         logo_opacity = 0.9
-    logo_size_percent = min(25, max(5, logo_size_percent))
-    logo_opacity = min(1.0, max(0.1, logo_opacity))
+    # An out-of-range value is not clamped to the boundary: the
+    # dashboard reports "using 12% / 0.9", so the runtime must use
+    # those same defaults, or the displayed settings would lie about
+    # the encode.
+    if not 5 <= logo_size_percent <= 25:
+        logo_size_percent = 12
+    if logo_opacity != logo_opacity or not 0.1 <= logo_opacity <= 1.0:
+        # nan / inf / out of range: min()/max() would silently map nan
+        # to 0.1 and inf to 1.0, disagreeing with the dashboard's 0.9.
+        logo_opacity = 0.9
     if logo_enabled and not logo_file.is_file():
         raise ValueError("LOGO_FILE does not point to an existing image")
     frame_enabled = _flag("FRAME_ENABLED", False)
@@ -348,7 +362,13 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
         raise ValueError("NOTIFY_TELEGRAM_CHAT requires NOTIFY_TELEGRAM_TOKEN")
     if notify_webhook_url and not re.fullmatch(r"https?://[^\s]+", notify_webhook_url):
         raise ValueError("NOTIFY_WEBHOOK_URL must be an HTTP or HTTPS URL")
-    notify_language = os.getenv("NOTIFY_LANGUAGE", metadata_language).strip().lower()
+    # NOTIFY_LANGUAGE defaults to the metadata language, but that may be
+    # "auto" (offered by the dashboard) or another language the notifier
+    # does not speak: defaulting blindly to it bricked startup with
+    # "NOTIFY_LANGUAGE must be ar or en" for a value the dashboard
+    # itself offers. Only inherit ar/en; anything else falls back to ar.
+    notify_default = metadata_language if metadata_language in {"ar", "en"} else "ar"
+    notify_language = os.getenv("NOTIFY_LANGUAGE", notify_default).strip().lower()
     if notify_language not in {"ar", "en"}:
         raise ValueError("NOTIFY_LANGUAGE must be ar or en")
     record_enabled = _flag("RECORD_ENABLED")

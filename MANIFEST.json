@@ -1,5 +1,5 @@
 {
-  "version": "4.8.9",
+  "version": "4.8.10",
   "files": [
     {
       "path": ".env.example",
@@ -23,7 +23,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "5830b09e83c083967e5a1e576bdd5b90c514a6ce0cf2e3fc9cbcb8839ea09c1e"
+      "sha256": "be455d2d43c34be74fa7e1fed8519b1ec5b468557cbb9213d304a95dbec86360"
     },
     {
       "path": "assets/live-relay-logo.png",
@@ -47,7 +47,7 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "c144b0b25dcad235e737daff84c338e89fdcea8f7e90f25f5190f0dbda832fc2"
+      "sha256": "80a5cb467a090b1a1128c64466bd52166d39e37e56f70c96b0e5e285692b0cfc"
     },
     {
       "path": "src/live_relay/.env.example",
@@ -55,7 +55,7 @@
     },
     {
       "path": "src/live_relay/__init__.py",
-      "sha256": "b61035bdaf71b1e3bc7683b02803655a41b25ea39fc377bbd8a8b87827f428a8"
+      "sha256": "f5566c2f3a2e4aa2f773519ce2626d9897aa87ebf9e12377a8114ef0d8d9768b"
     },
     {
       "path": "src/live_relay/__main__.py",
@@ -63,7 +63,7 @@
     },
     {
       "path": "src/live_relay/config.py",
-      "sha256": "319dda6370ea1862c64a68687b80d300e7d73fac1df4cf9b0740dcbc27c156a4"
+      "sha256": "807afcc202abee699f4eaa0ebda289fb225a91099dd609b36c897115214a30a9"
     },
     {
       "path": "src/live_relay/dashboard.html",
@@ -71,11 +71,11 @@
     },
     {
       "path": "src/live_relay/dashboard.py",
-      "sha256": "49a495ebb5d7513923733735dd0df0c3f81364949794631e1c631c605cc30113"
+      "sha256": "b9177d2f5d369b3968bbd864ec41361886cf75d47b3d662d737f2eabbc51f86d"
     },
     {
       "path": "src/live_relay/destinations.py",
-      "sha256": "9fafee8aaf38abcc5fe9ec8ed1dab8e8d8d56a31819b3c0eac51d3c81043a010"
+      "sha256": "a5c3845c369e81e2613af74175e33cc79fef30a4fda6c6413150204291f2d97d"
     },
     {
       "path": "src/live_relay/encoder.py",
@@ -115,7 +115,7 @@
     },
     {
       "path": "src/live_relay/source.py",
-      "sha256": "485e7bf9de45f4117b03653bb544b5e571a792af07602aaf1211e6c989775f75"
+      "sha256": "f0d409e3c955e1f6bb370288849d76795c1a81f995946aeac2c71159eedfaae8"
     },
     {
       "path": "src/live_relay/source_platforms.py",
@@ -127,7 +127,7 @@
     },
     {
       "path": "src/live_relay/thumbnail_ai.py",
-      "sha256": "166c6eb8ce4c65918ca6deee74ddd91d36ae53f40734cf06d2aa1276a4080873"
+      "sha256": "285db098b9f85be0623d89d13228dfa2008f4602cd2752d59db068a889dd1fa8"
     },
     {
       "path": "src/live_relay/thumbnails.py",
@@ -147,7 +147,7 @@
     },
     {
       "path": "tests/test_core.py",
-      "sha256": "5aa8dac4fc1dc06e342f980699c20fdd9f1763811569a1cf793d3f59966712b4"
+      "sha256": "1a35715e71ca33b283de1665e2e38f84e0120b629767eb8970d9a3a426f66983"
     },
     {
       "path": "tests/test_dashboard.py",
@@ -164,6 +164,10 @@
     {
       "path": "tests/test_regression_4_8_1.py",
       "sha256": "248d712760f45eacb3d26c609e3c71379b39b863eecadc38412cc629f0b5e00c"
+    },
+    {
+      "path": "tests/test_regression_4_8_10.py",
+      "sha256": "e4463c1da6bf6752fb004e65ba77650dee76d6a0fea07d8c1bf7f9695e02ba5f"
     },
     {
       "path": "tests/test_regression_4_8_3.py",
@@ -191,7 +195,7 @@
     },
     {
       "path": "tests/test_regression_4_8_9.py",
-      "sha256": "8184a96f2cef9f236631aafbceaf7665b301de496fa6c7bfa6e8a5c35c88322c"
+      "sha256": "cf983ea20aa5595f60972befbd1e9bdcc177ddf2be21ae136c9b4787f234c29a"
     },
     {
       "path": "tests/test_source_platforms.py",
@@ -207,7 +211,7 @@
     },
     {
       "path": "tests/test_updater.py",
-      "sha256": "cc63f2b763517a3deb702d077a79a4aab6f6f589256ac9ab0acba7e4da3c4375"
+      "sha256": "033b82a65fc8fd2c31a4da8049cbcce6f02a52541d32eafceca78b24990055bb"
     }
   ]
 }

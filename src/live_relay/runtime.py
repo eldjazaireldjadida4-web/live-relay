@@ -29,6 +29,9 @@ class RelayStatus:
             "last_error": "",
             "active_platforms": [],
             "destination_errors": {},
+            "notification_failures": [],
+            "notification_failure_count": 0,
+            "youtube_quota": {},
             "updated_at": time.time(),
         }
     )

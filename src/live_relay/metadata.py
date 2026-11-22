@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -28,6 +29,57 @@ class StreamMetadata:
             "category_id": self.category_id,
             "provider": self.provider,
         }
+
+
+GEMINI_MAX_ATTEMPTS = 3
+GEMINI_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+# HTTP statuses worth a second try: rate limiting and server-side
+# failures. Other 4xx errors (bad key, bad request) cannot succeed on
+# retry, so they fail immediately.
+_GEMINI_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+def post_gemini(
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    timeout: tuple[float, float],
+    attempts: int = GEMINI_MAX_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+):
+    """POST to the Gemini interactions endpoint with bounded retries.
+
+    Transient failures (network errors, 429 and 5xx) are retried a few
+    times with backoff; a successful response is returned as-is and a
+    non-retryable error raises :class:`RuntimeError` at once. Callers
+    keep their existing fallback behaviour when this raises.
+    """
+    last_error: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=timeout)
+        except requests.RequestException as exc:
+            last_error = exc
+        else:
+            if response.ok:
+                return response
+            if response.status_code in _GEMINI_RETRYABLE_STATUSES:
+                last_error = RuntimeError(
+                    f"Gemini returned HTTP {response.status_code}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Gemini returned HTTP {response.status_code}"
+                )
+        if attempt < max(1, attempts) - 1:
+            backoff = GEMINI_RETRY_BACKOFF_SECONDS[
+                min(attempt, len(GEMINI_RETRY_BACKOFF_SECONDS) - 1)
+            ]
+            logging.warning(
+                "Gemini request failed (%s); retrying in %.1fs", last_error, backoff
+            )
+            sleep(backoff)
+    raise last_error  # type: ignore[misc]
 
 
 def clean_description(value: str, limit: int = 5000) -> str:
@@ -243,14 +295,12 @@ def generate_metadata(settings: Any, source: LiveSource) -> StreamMetadata:
         },
     }
     try:
-        response = requests.post(
+        response = post_gemini(
             "https://generativelanguage.googleapis.com/v1beta/interactions",
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json=body,
+            body=body,
             timeout=(4, 15),
         )
-        if not response.ok:
-            raise RuntimeError(f"Gemini returned HTTP {response.status_code}")
         payload = response.json()
         output = _response_text(payload) if isinstance(payload, dict) else ""
         result = json.loads(output)

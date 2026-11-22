@@ -29,6 +29,78 @@ YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
 # already uses timeout=30 on its calls).
 YOUTUBE_HTTP_TIMEOUT_SECONDS = 30
 
+# YouTube Data API quota: one status probe costs 2 units (one
+# liveBroadcasts.list + one liveStreams.list, 1 unit each at part=status).
+# The default daily quota is 10,000 units, so probing every 30 s would
+# burn more than half of it in a day. The tracker below stretches the
+# probe interval as the budget runs out, and stops polling entirely
+# once it is spent; usage resets at midnight UTC.
+YOUTUBE_STATUS_CHECK_COST = 2
+YOUTUBE_DAILY_QUOTA_UNITS = 10_000
+YOUTUBE_QUOTA_SLOW_AT = 0.70
+YOUTUBE_QUOTA_SLOWER_AT = 0.85
+YOUTUBE_QUOTA_CRITICAL_AT = 0.95
+
+
+class YouTubeQuotaTracker:
+    """Daily YouTube Data API quota usage for status polling."""
+
+    def __init__(self, budget: int = YOUTUBE_DAILY_QUOTA_UNITS) -> None:
+        self.budget = max(1, int(budget))
+        self.used = 0
+        self._day = self._today()
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+
+    def _rollover(self) -> None:
+        today = self._today()
+        if today != self._day:
+            self._day = today
+            self.used = 0
+
+    def record(self, units: int) -> None:
+        self._rollover()
+        self.used += max(0, int(units))
+
+    @property
+    def used_fraction(self) -> float:
+        self._rollover()
+        return min(1.0, self.used / self.budget)
+
+    @property
+    def remaining(self) -> int:
+        self._rollover()
+        return max(0, self.budget - self.used)
+
+    def can_poll(self) -> bool:
+        """False once the daily budget is spent; polling resumes tomorrow."""
+        return self.used_fraction < 1.0
+
+    def poll_interval(self, base_seconds: float) -> float:
+        """Probe interval for the given base interval, stretched as the
+        daily budget runs out (2x past 70%, 4x past 85%, 8x past 95%)."""
+        fraction = self.used_fraction
+        if fraction >= YOUTUBE_QUOTA_CRITICAL_AT:
+            factor = 8.0
+        elif fraction >= YOUTUBE_QUOTA_SLOWER_AT:
+            factor = 4.0
+        elif fraction >= YOUTUBE_QUOTA_SLOW_AT:
+            factor = 2.0
+        else:
+            factor = 1.0
+        return float(base_seconds) * factor
+
+    def snapshot(self) -> dict[str, Any]:
+        self._rollover()
+        return {
+            "used": self.used,
+            "budget": self.budget,
+            "remaining": self.remaining,
+            "used_fraction": round(self.used_fraction, 3),
+        }
+
 
 def _youtube_service(credentials: Any):
     """Build a YouTube Data API client with a bounded HTTP timeout."""
@@ -105,6 +177,11 @@ class YouTubeDestination:
         self.broadcast: dict[str, Any] | None = None
         self.stream: dict[str, Any] | None = None
         self.metadata: StreamMetadata | None = None
+        self.quota = YouTubeQuotaTracker(
+            budget=getattr(
+                settings, "youtube_quota_budget", YOUTUBE_DAILY_QUOTA_UNITS
+            )
+        )
 
     def _load_credentials(self, allow_browser: bool) -> tuple[Path, Any]:
         from google.auth.transport.requests import Request
@@ -367,6 +444,10 @@ class YouTubeDestination:
             raise RuntimeError(
                 "YouTube no longer knows the broadcast or stream of this session."
             )
+        # A successful probe consumed quota; record it so the supervisor
+        # can stretch the polling interval before the daily budget runs
+        # out. A failed probe records nothing: no usable data came back.
+        self.quota.record(YOUTUBE_STATUS_CHECK_COST)
         result = {
             "broadcast_status": str(
                 (broadcast[0].get("status") or {}).get("lifeCycleStatus") or "unknown"

@@ -7,8 +7,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 _TIMEOUT_SECONDS = 10
 
@@ -68,10 +68,57 @@ class Notifier:
     telegram_chat: str = ""
     webhook_url: str = ""
     language: str = "ar"
+    # Called (in the delivery thread) for every failed delivery with
+    # (failure_dict, total_failure_count); the relay wires it to the
+    # dashboard status so a dead Telegram/webhook is visible instead of
+    # silently swallowed.
+    on_failure: Callable[[dict[str, Any], int], None] | None = None
+    # Mutable failure record held in one container: the dataclass is
+    # frozen, so the counters live inside this dict, never rebound.
+    _state: dict[str, Any] = field(
+        default_factory=lambda: {"count": 0, "last": None},
+        repr=False,
+        compare=False,
+    )
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     @property
     def enabled(self) -> bool:
         return bool(self.telegram_token or self.webhook_url)
+
+    def last_failure(self) -> dict[str, Any] | None:
+        """The most recent failed delivery, or None when none failed."""
+        with self._lock:
+            last = self._state.get("last")
+        return dict(last) if isinstance(last, dict) else None
+
+    def failure_count(self) -> int:
+        """How many deliveries have failed since this notifier was built."""
+        with self._lock:
+            return int(self._state.get("count", 0))
+
+    def _record_failure(self, channel: str, event: str, error: str) -> None:
+        failure = {
+            "channel": channel,
+            "event": event,
+            "error": str(error)[:200],
+            "at": time.time(),
+        }
+        with self._lock:
+            self._state["count"] = int(self._state.get("count", 0)) + 1
+            self._state["last"] = failure
+            total = self._state["count"]
+        logging.warning(
+            "Notification to %s failed for %s: %s", channel, event, error
+        )
+        callback = self.on_failure
+        if callback is not None:
+            try:
+                callback(dict(failure), total)
+            except Exception:
+                logging.debug("Notification failure callback failed", exc_info=True)
 
     def notify(self, event: str, **fields: Any) -> None:
         if not self.enabled:
@@ -92,16 +139,25 @@ class Notifier:
     def _deliver(self, event: str, fields: dict[str, Any]) -> None:
         try:
             if self.webhook_url:
-                self._post_json(self.webhook_url, self._webhook_payload(event, fields))
+                self._post_json(
+                    self.webhook_url,
+                    self._webhook_payload(event, fields),
+                    channel="webhook",
+                    event=event,
+                )
         except Exception as exc:
+            self._record_failure("webhook", event, type(exc).__name__)
             logging.debug("Webhook notification failed: %s", exc)
         try:
             if self.telegram_token:
                 self._post_json(
                     f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
                     self._telegram_payload(event, fields),
+                    channel="telegram",
+                    event=event,
                 )
         except Exception as exc:
+            self._record_failure("telegram", event, type(exc).__name__)
             logging.debug("Telegram notification failed: %s", exc)
 
     def _webhook_payload(self, event: str, fields: dict[str, Any]) -> dict[str, Any]:
@@ -132,7 +188,15 @@ class Notifier:
             "disable_web_page_preview": True,
         }
 
-    def _post_json(self, url: str, payload: dict[str, Any]) -> None:
+    def _post_json(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        channel: str = "",
+        event: str = "",
+    ) -> bool:
+        """POST a notification payload; False (and a recorded failure)
+        when the endpoint rejects it or cannot be reached."""
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -144,12 +208,20 @@ class Notifier:
             with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
                 response.read()
         except urllib.error.HTTPError as exc:
-            logging.debug(
-                "Notification endpoint returned HTTP %s", exc.code
-            )
+            self._record_failure(channel or "webhook", event, f"HTTP {exc.code}")
+            logging.debug("Notification endpoint returned HTTP %s", exc.code)
+            return False
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            self._record_failure(channel or "webhook", event, type(exc).__name__)
+            logging.debug("Notification delivery failed: %s", exc)
+            return False
+        return True
 
 
-def notifier_from_settings(settings: Any) -> Notifier:
+def notifier_from_settings(
+    settings: Any,
+    on_failure: Callable[[dict[str, Any], int], None] | None = None,
+) -> Notifier:
     return Notifier(
         telegram_token=getattr(settings, "notify_telegram_token", ""),
         telegram_chat=getattr(settings, "notify_telegram_chat", ""),
@@ -160,6 +232,7 @@ def notifier_from_settings(settings: Any) -> Notifier:
             getattr(settings, "metadata_language", "ar"),
         )
         or "ar",
+        on_failure=on_failure,
     )
 
 

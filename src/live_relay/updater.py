@@ -16,7 +16,11 @@ Safety rules, all deliberate:
   size when GitHub gives one, and :func:`zipfile.ZipFile.testzip` at
   download; its size and sha256 are recorded at staging and re-checked at
   apply time, and the extracted tree must prove it is live-relay at the
-  staged version before any file is touched.
+  staged version before any file is touched. When the release carries a
+  ``MANIFEST.json`` (file list + sha256 hashes, generated at release
+  time), every extracted file is verified against it — a missing,
+  modified or unlisted file refuses the update; a release without a
+  manifest keeps the previous checks.
 - Applying an update never touches local secrets or local state: ``.env``,
   ``.venv``, OAuth/client-secret files, TLS keys, logs and the state
   directory are preserved, and zip members escaping the project root
@@ -62,6 +66,23 @@ _VERSION_PATTERN = re.compile(
 _PRESERVED_NAMES = {".env", ".git", ".venv", ".test-venv", "__pycache__"}
 _PRESERVED_SUFFIXES = (".key", ".crt", ".pem", ".p12", ".log")
 _PRESERVED_PREFIXES = ("client_secret", "oauth-client")
+
+# The release manifest: a file list + sha256 hashes for every
+# releasable file, generated from the project tree at release time
+# (``python -m live_relay.updater --manifest``) and committed at the
+# project root, so it travels inside the release zipball itself.
+MANIFEST_FILENAME = "MANIFEST.json"
+_MANIFEST_EXCLUDED_DIRS = {
+    ".git",
+    ".venv",
+    ".test-venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+}
+_MANIFEST_EXCLUDED_NAMES = {".env", MANIFEST_FILENAME, ".DS_Store"}
+_MANIFEST_EXCLUDED_SUFFIXES = (".key", ".crt", ".pem", ".p12", ".log")
+_MANIFEST_EXCLUDED_PREFIXES = ("client_secret", "oauth-client")
 
 
 def parse_version(value: str) -> tuple[int, ...] | None:
@@ -277,6 +298,116 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _manifest_excluded(relative: Path) -> bool:
+    """True for files that must never appear in a release manifest:
+    local secrets, caches, VCS metadata and build residue."""
+    if any(part in _MANIFEST_EXCLUDED_DIRS for part in relative.parts):
+        return True
+    if any(part.endswith(".egg-info") for part in relative.parts):
+        return True
+    name = relative.name
+    if name in _MANIFEST_EXCLUDED_NAMES:
+        return True
+    lowered = name.lower()
+    if lowered.endswith(_MANIFEST_EXCLUDED_SUFFIXES):
+        return True
+    if any(lowered.startswith(prefix) for prefix in _MANIFEST_EXCLUDED_PREFIXES):
+        return True
+    return False
+
+
+def build_manifest(project_root: Path, version: str) -> dict:
+    """File list + sha256 hashes for every releasable file in the tree.
+
+    The manifest itself, local secrets, caches and build residue are
+    excluded. The output is deterministic (sorted paths), so a
+    regenerated manifest compares equal to the committed one.
+    """
+    project_root = Path(project_root).resolve()
+    files = []
+    for path in sorted(project_root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(project_root)
+        if _manifest_excluded(relative):
+            continue
+        files.append({"path": relative.as_posix(), "sha256": _file_sha256(path)})
+    return {"version": version, "files": files}
+
+
+def write_manifest(project_root: Path, version: str) -> Path:
+    """Regenerate MANIFEST.json in the project root for ``version``.
+
+    Run this before tagging a release; the updater verifies the
+    downloaded update against the manifest it carries.
+    """
+    manifest = build_manifest(project_root, version)
+    path = Path(project_root) / MANIFEST_FILENAME
+    path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def verify_manifest(content_root: Path, version: str) -> bool:
+    """Verify an extracted update tree against its MANIFEST.json.
+
+    Returns False when the tree carries no manifest (older releases):
+    the caller then falls back to the existing zip-integrity and
+    version checks. Raises :class:`ValueError` when a manifest exists
+    but the tree does not match it: a version mismatch, a missing or
+    modified file, or an unlisted file.
+    """
+    manifest_path = Path(content_root) / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        logging.info("Update has no manifest; using zip-integrity checks only")
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("Update manifest could not be read") from exc
+    if not isinstance(manifest, dict) or manifest.get("version") != version:
+        raise ValueError("Update manifest is for a different version")
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        raise ValueError("Update manifest has no file list")
+    expected: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("Update manifest has a malformed entry")
+        path = str(entry.get("path") or "")
+        digest = str(entry.get("sha256") or "")
+        parsed = Path(path)
+        if (
+            not path
+            or not digest
+            or parsed.is_absolute()
+            or ".." in parsed.parts
+        ):
+            raise ValueError("Update manifest has an unsafe path")
+        expected[path] = digest
+    for path, digest in expected.items():
+        candidate = content_root / path
+        if not candidate.is_file():
+            raise ValueError(f"Update is missing file {path}")
+        if _file_sha256(candidate) != digest:
+            raise ValueError(
+                f"Update file {path} does not match its manifest hash"
+            )
+    for found in sorted(content_root.rglob("*")):
+        if not found.is_file():
+            continue
+        relative = found.relative_to(content_root)
+        if relative.name == MANIFEST_FILENAME or _is_preserved(relative):
+            continue
+        if relative.as_posix() not in expected:
+            raise ValueError(
+                f"Update contains unlisted file {relative.as_posix()}"
+            )
+    return True
+
+
 def stage_update(state_dir: Path, release: dict, zip_path: Path) -> dict:
     """Record a verified downloaded release as staged for the next start.
 
@@ -470,6 +601,11 @@ def apply_pending_update(project_root: Path, state_dir: Path) -> str | None:
                 break
             if content_root is None:
                 raise first_error  # type: ignore[misc]
+            # A manifest travels inside the release itself: prove the
+            # extracted tree matches it file by file, instead of
+            # trusting the zip contents alone. A tree without one (an
+            # older release) keeps the previous checks.
+            verify_manifest(content_root, version)
             for source in sorted(content_root.rglob("*")):
                 if not source.is_file():
                     continue
@@ -517,9 +653,20 @@ def _resolve_state_dir(explicit: str | None) -> Path:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="live-relay updater")
     parser.add_argument("--apply", action="store_true", help="apply a staged update")
+    parser.add_argument(
+        "--manifest",
+        action="store_true",
+        help="regenerate MANIFEST.json for the current version and exit",
+    )
     parser.add_argument("--project-root", default=".", help="project root to update")
     parser.add_argument("--state-dir", default=None, help="state directory")
     args = parser.parse_args(argv)
+    if args.manifest:
+        from . import __version__
+
+        path = write_manifest(Path(args.project_root), __version__)
+        print(f"Wrote {path} for version {__version__}.")
+        return 0
     if not args.apply:
         parser.print_help()
         return 2

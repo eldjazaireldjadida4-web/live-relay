@@ -26,6 +26,7 @@ class Settings:
     youtube_mode: str
     youtube_static_key: str
     youtube_backup: bool
+    youtube_quota_budget: int
     youtube_manual_auth: bool
     youtube_manual_auth_code: str
     youtube_privacy: str
@@ -351,6 +352,10 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
         raise ValueError("NOTIFY_LANGUAGE must be ar or en")
     record_enabled = _flag("RECORD_ENABLED")
     try:
+        youtube_quota_budget = int(os.getenv("YOUTUBE_QUOTA_BUDGET", "10000"))
+    except ValueError as exc:
+        raise ValueError("YOUTUBE_QUOTA_BUDGET must be a whole number") from exc
+    try:
         reconnect_delay = int(os.getenv("RECONNECT_DELAY", "5"))
         source_retry = int(os.getenv("SOURCE_RETRY", "30"))
         stall_timeout = int(os.getenv("STALL_TIMEOUT", "45"))
@@ -399,6 +404,7 @@ def load_settings(platforms_override: tuple[str, ...] | None = None) -> Settings
         youtube_mode=youtube_mode,
         youtube_static_key=youtube_static_key,
         youtube_backup=_flag("YOUTUBE_BACKUP"),
+        youtube_quota_budget=max(100, youtube_quota_budget),
         youtube_manual_auth=youtube_manual_auth,
         youtube_manual_auth_code=youtube_manual_auth_code,
         youtube_privacy=privacy,

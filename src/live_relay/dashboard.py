@@ -48,6 +48,10 @@ from .thumbnails import (
 )
 
 PROJECT_ROOT = resolve_project_root()
+# A dashboard page stays usable for a day on its session token; a
+# reload issues a fresh one. The master control token never expires
+# and is never sent to any client.
+SESSION_TOKEN_TTL_SECONDS = 86400
 SECRET_KEYS = (
     "YOUTUBE_STREAM_KEY",
     "FACEBOOK_ACCESS_TOKEN",
@@ -66,6 +70,7 @@ CONFIG_KEYS = (
     "YOUTUBE_PRIVACY_STATUS",
     "YOUTUBE_CATEGORY_ID",
     "YOUTUBE_BACKUP",
+    "YOUTUBE_QUOTA_BUDGET",
     "YOUTUBE_TITLE_OVERRIDE",
     "YOUTUBE_DESCRIPTION_OVERRIDE",
     "YOUTUBE_TAGS_OVERRIDE",
@@ -142,6 +147,7 @@ def _default_value(key: str) -> str:
         "FFMPEG_PRESET": "veryfast",
         "YTDLP_FORMAT": "b[height<=720]/bv*[height<=720]+ba/best",
         "YOUTUBE_BACKUP": "false",
+        "YOUTUBE_QUOTA_BUDGET": "10000",
         "PIPE_MODE": "false",
         "RECONNECT_DELAY": "5",
         "SOURCE_RETRY": "30",
@@ -162,11 +168,50 @@ class DashboardController:
         self._stop_event: threading.Event | None = None
         self.status = RelayStatus()
         self.control_token = secrets.token_urlsafe(32)
+        # Page-scoped session tokens (M2): the real control token is
+        # never sent to any client. Each page load gets its own random
+        # token, which authorises API calls from that page only and
+        # expires after a day; reloading the page issues a fresh one.
+        self._session_tokens: dict[str, float] = {}
+        self._session_lock = threading.Lock()
         self.update_restart_requested = False
         self._shutdown_callback = None
         self.ensure_env_file()
         self.discover_youtube_client_file()
         load_dotenv(self.env_path, override=True)
+
+    def issue_session_token(self) -> str:
+        """Issue a page-scoped token for one dashboard page load.
+
+        The value embedded in the served page is this token, never the
+        real control token: any local process reading the page only
+        learns a token that expires and dies with the server, while the
+        master token stays server-side.
+        """
+        token = secrets.token_urlsafe(32)
+        now = time.monotonic()
+        with self._session_lock:
+            self._session_tokens = {
+                value: expiry
+                for value, expiry in self._session_tokens.items()
+                if expiry > now
+            }
+            self._session_tokens[token] = now + SESSION_TOKEN_TTL_SECONDS
+        return token
+
+    def valid_token(self, token: str) -> bool:
+        """True for the master control token or an unexpired session token."""
+        if token and secrets.compare_digest(token, self.control_token):
+            return True
+        with self._session_lock:
+            expiry = self._session_tokens.get(token or "")
+        if expiry is None:
+            return False
+        if time.monotonic() > expiry:
+            with self._session_lock:
+                self._session_tokens.pop(token, None)
+            return False
+        return True
 
     def ensure_env_file(self) -> None:
         if self.env_path.exists():
@@ -392,6 +437,20 @@ class DashboardController:
         if logo_opacity != logo_opacity or not 0.1 <= logo_opacity <= 1:
             missing.append("LOGO_OPACITY must be between 0.1 and 1; using 0.9.")
             logo_opacity = 0.9
+        # Same guard as the logo numbers above: one bad quota value must
+        # not break the whole config response.
+        try:
+            youtube_quota_budget = int(
+                values.get(
+                    "YOUTUBE_QUOTA_BUDGET",
+                    _default_value("YOUTUBE_QUOTA_BUDGET"),
+                )
+            )
+        except (TypeError, ValueError):
+            youtube_quota_budget = 10000
+            missing.append("YOUTUBE_QUOTA_BUDGET is not a number; using 10000.")
+        if youtube_quota_budget < 100:
+            youtube_quota_budget = 100
         config = {
             "source_url": values.get("SOURCE_URL", _default_value("SOURCE_URL")),
             "source_platform": values.get("SOURCE_PLATFORM", "auto"),
@@ -414,6 +473,7 @@ class DashboardController:
             ),
             "youtube_tags_override": values.get("YOUTUBE_TAGS_OVERRIDE", ""),
             "youtube_backup": _as_bool(values.get("YOUTUBE_BACKUP", "false")),
+            "youtube_quota_budget": youtube_quota_budget,
             "youtube_authorized": token_file.is_file(),
             "youtube_static_key_set": bool(
                 values.get("YOUTUBE_STREAM_KEY", "").strip()
@@ -683,6 +743,7 @@ class DashboardController:
                 "STALL_TIMEOUT",
                 "HEARTBEAT",
                 "SOURCE_END_GRACE",
+                "YOUTUBE_QUOTA_BUDGET",
             ):
                 if timing_key in updates:
                     try:
@@ -1383,9 +1444,7 @@ def build_handler_class(
             if origin and origin != f"http://{self.headers.get('Host', '')}":
                 self._json({"error": "Cross-origin requests are not allowed."}, 403)
                 return False
-            if not secrets.compare_digest(
-                self.headers.get("X-Relay-Token", ""), controller.control_token
-            ):
+            if not controller.valid_token(self.headers.get("X-Relay-Token", "")):
                 self._json(
                     {"error": "Invalid local control token. Reload the dashboard."}, 403
                 )
@@ -1412,7 +1471,7 @@ def build_handler_class(
             if request_path == "/":
                 try:
                     html = html_path.read_text(encoding="utf-8").replace(
-                        "__CONTROL_TOKEN__", controller.control_token
+                        "__SESSION_TOKEN__", controller.issue_session_token()
                     )
                 except OSError:
                     self._json({"error": "Dashboard page is missing."}, 500)

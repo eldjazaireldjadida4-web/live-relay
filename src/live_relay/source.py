@@ -5,8 +5,10 @@ import logging
 import re
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .config import Settings
 from .encoder import redact_urls
@@ -186,3 +188,123 @@ def build_pipe_command(settings: Settings) -> list[str]:
     elif settings.cookies_from_browser:
         command[-1:-1] = ["--cookies-from-browser", settings.cookies_from_browser]
     return command
+
+
+def _stop_pipe_process(process: subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+class SharedSourcePipe:
+    """One yt-dlp process feeding every encoder worker.
+
+    In pipe mode each destination used to spawn its own yt-dlp process,
+    all downloading the same source. The shared pipe spawns yt-dlp once
+    and a pump thread copies its stdout to every subscribed ffmpeg
+    stdin, so N destinations cost one download instead of N. A worker
+    that joins mid-stream reads from the current position of the
+    MPEG-TS stream; ffmpeg re-syncs on the next keyframe.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._command = build_pipe_command(settings)
+        self._process: subprocess.Popen[bytes] | None = None
+        self._pump: threading.Thread | None = None
+        self._subscribers: set[Any] = set()
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+
+    def start(self) -> bool:
+        if self.alive():
+            return True
+        self._stopped.clear()
+        try:
+            process = subprocess.Popen(
+                self._command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except OSError as exc:
+            logging.error("Could not start the shared yt-dlp pipe: %s", exc)
+            return False
+        self._process = process
+        self._pump = threading.Thread(
+            target=self._pump_stdout, name="yt-dlp-pump", daemon=True
+        )
+        self._pump.start()
+        return True
+
+    def alive(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    @property
+    def process(self) -> subprocess.Popen[bytes] | None:
+        return self._process
+
+    def restart(self) -> bool:
+        self.stop()
+        return self.start()
+
+    def subscribe(self, stream: Any) -> None:
+        with self._lock:
+            self._subscribers.add(stream)
+
+    def unsubscribe(self, stream: Any) -> None:
+        with self._lock:
+            self._subscribers.discard(stream)
+
+    def subscriber_count(self) -> int:
+        with self._lock:
+            return len(self._subscribers)
+
+    def _pump_stdout(self) -> None:
+        process = self._process
+        if process is None or process.stdout is None:
+            return
+        try:
+            while not self._stopped.is_set():
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                with self._lock:
+                    subscribers = list(self._subscribers)
+                for subscriber in subscribers:
+                    try:
+                        subscriber.write(chunk)
+                        subscriber.flush()
+                    except (OSError, ValueError):
+                        self.unsubscribe(subscriber)
+        except (OSError, ValueError):
+            pass
+
+    def stop(self) -> None:
+        self._stopped.set()
+        process, pump = self._process, self._pump
+        self._process = None
+        self._pump = None
+        if process is not None:
+            _stop_pipe_process(process)
+            for stream in (process.stdout, process.stderr):
+                if stream:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+        if pump is not None:
+            pump.join(timeout=2)
+        with self._lock:
+            subscribers = list(self._subscribers)
+            self._subscribers.clear()
+        for subscriber in subscribers:
+            try:
+                subscriber.close()
+            except (OSError, ValueError):
+                pass

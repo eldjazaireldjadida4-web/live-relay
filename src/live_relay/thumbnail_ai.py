@@ -13,6 +13,7 @@ from typing import Any
 
 import requests
 
+from .metadata import post_gemini
 from .thumbnails import manual_hold
 
 INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -105,14 +106,12 @@ def generate_image_bytes(settings: Any, prompt: str) -> bytes | None:
         },
     }
     try:
-        response = requests.post(
+        response = post_gemini(
             INTERACTIONS_URL,
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json=body,
+            body=body,
             timeout=(4, 120),
         )
-        if not response.ok:
-            raise RuntimeError(f"Gemini image API returned HTTP {response.status_code}")
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Gemini returned a non-object response")

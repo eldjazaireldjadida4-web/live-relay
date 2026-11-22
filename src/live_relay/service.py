@@ -30,7 +30,7 @@ from .metadata import (
 )
 from .quality import AdaptiveQuality
 from .runtime import RelayStatus
-from .source import LiveSource, build_pipe_command, resolve_source
+from .source import LiveSource, SharedSourcePipe, build_pipe_command, resolve_source
 from .source_platforms import source_platform_for, source_platform_label
 from .thumbnail_ai import generate_auto_thumbnail_task
 from .thumbnails import get_thumbnail_path
@@ -435,6 +435,10 @@ class WorkerState:
     index: int
     process: subprocess.Popen[str] | None = None
     pipe_process: subprocess.Popen[str] | None = None
+    # Shared-pipe mode (M9): the ffmpeg stdin subscribed to the one
+    # yt-dlp process, and the pipe itself, so teardown can unsubscribe.
+    pipe_subscription: Any = None
+    shared_pipe: SharedSourcePipe | None = None
     progress: Progress = field(default_factory=Progress)
     transport_failure: threading.Event = field(default_factory=threading.Event)
     threads: list[threading.Thread] = field(default_factory=list)
@@ -454,9 +458,33 @@ def _worker_backoff(failures: int) -> float:
     return min(WORKER_BACKOFF_CAP, 2.0 * (2 ** max(0, failures - 1)))
 
 
+def _youtube_status_due(
+    youtube: Any, now: float, last_check: float, heartbeat: float
+) -> bool:
+    """True when a YouTube status probe is due, stretching the interval
+    as the daily API quota runs out (M11). A destination without a
+    quota tracker polls at the plain heartbeat rate."""
+    quota = getattr(youtube, "quota", None)
+    if quota is None:
+        return now - last_check >= heartbeat
+    return quota.can_poll() and now - last_check >= quota.poll_interval(heartbeat)
+
+
 def _teardown_worker(worker: WorkerState) -> None:
     _stop_process(worker.process)
     _stop_process(worker.pipe_process)
+    if worker.pipe_subscription is not None:
+        # Shared-pipe mode: stop feeding this ffmpeg stdin and let the
+        # pump drop the subscriber; the pipe itself lives on for the
+        # other workers.
+        if worker.shared_pipe is not None:
+            worker.shared_pipe.unsubscribe(worker.pipe_subscription)
+        try:
+            worker.pipe_subscription.close()
+        except (OSError, ValueError):
+            pass
+        worker.pipe_subscription = None
+        worker.shared_pipe = None
     streams: list[Any] = []
     if worker.process is not None:
         streams.extend((worker.process.stdout, worker.process.stderr))
@@ -501,6 +529,7 @@ def _start_worker(
     session: DestinationSession,
     quality: AdaptiveQuality,
     settings: Settings,
+    shared_pipe: SharedSourcePipe | None = None,
 ) -> bool:
     portrait = getattr(source, "width", 0) > 0 and getattr(
         source, "height", 0
@@ -543,18 +572,32 @@ def _start_worker(
     pipe_process: subprocess.Popen[str] | None = None
     input_stream: Any = subprocess.DEVNULL
     if settings.pipe_mode:
-        try:
-            pipe_process = subprocess.Popen(
-                build_pipe_command(settings),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-            )
-        except OSError as exc:
-            logging.error("Could not start yt-dlp pipe for %s: %s", worker.name, exc)
-            return False
-        input_stream = pipe_process.stdout
+        if shared_pipe is not None:
+            # Shared pipe (M9): one yt-dlp process feeds every worker.
+            # A dead pipe is restarted here, so the restart is paced by
+            # the existing worker backoff instead of a tight loop.
+            if not shared_pipe.alive() and not shared_pipe.restart():
+                logging.error(
+                    "Could not start the shared yt-dlp pipe for %s",
+                    worker.name,
+                )
+                return False
+            input_stream = subprocess.PIPE
+        else:
+            try:
+                pipe_process = subprocess.Popen(
+                    build_pipe_command(settings),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+            except OSError as exc:
+                logging.error(
+                    "Could not start yt-dlp pipe for %s: %s", worker.name, exc
+                )
+                return False
+            input_stream = pipe_process.stdout
     try:
         process = subprocess.Popen(
             commands[0],
@@ -572,6 +615,10 @@ def _start_worker(
         return False
     if pipe_process and pipe_process.stdout:
         pipe_process.stdout.close()
+    if shared_pipe is not None and settings.pipe_mode and process.stdin is not None:
+        shared_pipe.subscribe(process.stdin)
+        worker.pipe_subscription = process.stdin
+        worker.shared_pipe = shared_pipe
     worker.process = process
     worker.pipe_process = pipe_process
     worker.progress = Progress()
@@ -628,7 +675,19 @@ def _start_encoder(
     ]
     started = time.monotonic()
     last_heartbeat = started
+    last_youtube_check = 0.0
     reason = "stopped"
+    # Shared yt-dlp pipe (M9): one download feeds every destination
+    # instead of one yt-dlp process per worker. It is started up front;
+    # a worker that finds it dead restarts it, paced by worker backoff.
+    shared_pipe: SharedSourcePipe | None = None
+    pipe_log_process: Any = None
+    if settings.pipe_mode:
+        shared_pipe = SharedSourcePipe(settings)
+        if not shared_pipe.start():
+            logging.warning(
+                "Shared yt-dlp pipe could not start; workers will retry it"
+            )
     logging.info(
         "Encoder supervision started for %d destination(s) at %s (%s video, %s audio)",
         len(workers),
@@ -663,6 +722,22 @@ def _start_encoder(
     try:
         while not stopped.is_set():
             now = time.monotonic()
+            if shared_pipe is not None:
+                # One log thread per yt-dlp process: a restarted pipe
+                # gets a fresh thread for its new stderr stream, and the
+                # old thread ends by itself when its stream hits EOF.
+                current_pipe = shared_pipe.process
+                if (
+                    current_pipe is not None
+                    and current_pipe is not pipe_log_process
+                    and current_pipe.stderr
+                ):
+                    pipe_log_process = current_pipe
+                    threading.Thread(
+                        target=_pump_logs,
+                        args=(current_pipe.stderr, stopped, "yt-dlp"),
+                        daemon=True,
+                    ).start()
             any_running = False
             restartable = False
             for worker in workers:
@@ -717,7 +792,13 @@ def _start_encoder(
                 if now >= worker.next_start:
                     current = refresh_source() if worker.failures else source
                     if _start_worker(
-                        worker, ffmpeg, current, session, quality, settings
+                        worker,
+                        ffmpeg,
+                        current,
+                        session,
+                        quality,
+                        settings,
+                        shared_pipe,
                     ):
                         any_running = True
                     else:
@@ -798,36 +879,54 @@ def _start_encoder(
                         quality.profile.name,
                     )
                 stream_health = None
-                if session.youtube and session.youtube.broadcast:
-                    try:
-                        youtube_status = session.youtube.check_status()
-                        stream_health = youtube_status.get("stream_health")
-                        logging.info(
-                            "YouTube status: broadcast=%s, stream=%s, ingest_health=%s",
-                            youtube_status["broadcast_status"],
-                            youtube_status["stream_status"],
-                            youtube_status["stream_health"],
+                youtube = session.youtube
+                if youtube and youtube.broadcast:
+                    quota = getattr(youtube, "quota", None)
+                    if quota is not None and not quota.can_poll():
+                        # Daily budget spent: skip the probe entirely
+                        # until tomorrow instead of burning quota the
+                        # account no longer has.
+                        logging.debug(
+                            "YouTube daily API quota spent (%d/%d units); "
+                            "status polling paused until tomorrow",
+                            quota.used,
+                            quota.budget,
                         )
-                        if (
-                            youtube_status["broadcast_status"] == "ready"
-                            and youtube_status["stream_status"] == "active"
-                        ):
-                            session.youtube.ensure_live()
-                        # Starvation is judged by the stream status, not the
-                        # health status: ``active`` means YouTube is receiving
-                        # data, while ``inactive``/``error`` means it is not.
-                        # ``noData`` health only means YouTube has no health
-                        # information about the stream, so it is neither
-                        # healthy nor starved on its own.
-                        starved = youtube_status["stream_status"] in {
-                            "inactive",
-                            "error",
-                        }
-                    except Exception as exc:
-                        logging.warning(
-                            "YouTube status check failed: %s",
-                            redact_urls(str(exc))[:200],
-                        )
+                    elif _youtube_status_due(
+                        youtube, now, last_youtube_check, settings.heartbeat
+                    ):
+                        last_youtube_check = now
+                        try:
+                            youtube_status = youtube.check_status()
+                            stream_health = youtube_status.get("stream_health")
+                            logging.info(
+                                "YouTube status: broadcast=%s, stream=%s, ingest_health=%s",
+                                youtube_status["broadcast_status"],
+                                youtube_status["stream_status"],
+                                youtube_status["stream_health"],
+                            )
+                            if (
+                                youtube_status["broadcast_status"] == "ready"
+                                and youtube_status["stream_status"] == "active"
+                            ):
+                                youtube.ensure_live()
+                            # Starvation is judged by the stream status, not the
+                            # health status: ``active`` means YouTube is receiving
+                            # data, while ``inactive``/``error`` means it is not.
+                            # ``noData`` health only means YouTube has no health
+                            # information about the stream, so it is neither
+                            # healthy nor starved on its own.
+                            starved = youtube_status["stream_status"] in {
+                                "inactive",
+                                "error",
+                            }
+                        except Exception as exc:
+                            logging.warning(
+                                "YouTube status check failed: %s",
+                                redact_urls(str(exc))[:200],
+                            )
+                    if status is not None and quota is not None:
+                        status.update(youtube_quota=quota.snapshot())
                 if starved and running:
                     no_data_streak += 1
                     if no_data_streak >= 3:
@@ -877,6 +976,8 @@ def _start_encoder(
     finally:
         for worker in workers:
             _teardown_worker(worker)
+        if shared_pipe is not None:
+            shared_pipe.stop()
 
     return reason, time.monotonic() - started
 
@@ -986,7 +1087,25 @@ def run(
     source_label = source_platform_label(source_platform)
     quality = AdaptiveQuality(settings.initial_profile)
     session: DestinationSession | None = None
-    notifier = notifier_from_settings(settings)
+
+    def _record_notification_failure(
+        failure: dict[str, Any], total: int
+    ) -> None:
+        # A dead Telegram bot or webhook used to fail silently in a
+        # background thread; keep the last few failures in the status
+        # so the dashboard shows them next to the destination errors.
+        if status is None:
+            return
+        failures = list(status.snapshot().get("notification_failures") or [])
+        failures.append(failure)
+        status.update(
+            notification_failures=failures[-5:],
+            notification_failure_count=total,
+        )
+
+    notifier = notifier_from_settings(
+        settings, on_failure=_record_notification_failure
+    )
     session_started_monotonic: float | None = None
     current_title = ""
     current_metadata: StreamMetadata | None = None

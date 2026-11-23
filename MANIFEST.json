@@ -1,5 +1,5 @@
 {
-  "version": "4.8.11",
+  "version": "4.8.12",
   "files": [
     {
       "path": ".env.example",
@@ -23,7 +23,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "5cef5cc417f36ecd50f2f90b3e766d491451df3cd765f6058434dff9604ffafb"
+      "sha256": "668dc5a28ac864af17bdb3b71677139551bbd19cf55b9cbfb8582065cc302213"
     },
     {
       "path": "assets/live-relay-logo.png",
@@ -47,7 +47,7 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "ae8308f6a7787b72c98a594ddd02d002d6a24a914b95d0fb78ffd916f533edd2"
+      "sha256": "f8f05adea85ab05d5ef396461ba2d88cf15e15b4e140d91d68599c443c99f72b"
     },
     {
       "path": "src/live_relay/.env.example",
@@ -55,7 +55,7 @@
     },
     {
       "path": "src/live_relay/__init__.py",
-      "sha256": "9aa237dddb9d0b24d99a911cea5d25b273e8a6c665aa16a5b0e9002cdf332264"
+      "sha256": "337545c428a22c9f3d2547936b0d5b46e2e064b2612826b0f01be414ee0112b9"
     },
     {
       "path": "src/live_relay/__main__.py",
@@ -71,11 +71,11 @@
     },
     {
       "path": "src/live_relay/dashboard.py",
-      "sha256": "b9177d2f5d369b3968bbd864ec41361886cf75d47b3d662d737f2eabbc51f86d"
+      "sha256": "1507697de3dd8fa01805eb3fc45c7d2ef8f8224df9199a50950e222d9f89bfd0"
     },
     {
       "path": "src/live_relay/destinations.py",
-      "sha256": "6f6538b8f4e5c857a230f88550ce4a64da87d5e1674162bee4389ecc7cf7b59f"
+      "sha256": "693cacd7ae994fe9e2baa5a4724f7d065d9891fce7ebed42e6898acfe0366946"
     },
     {
       "path": "src/live_relay/encoder.py",
@@ -111,7 +111,7 @@
     },
     {
       "path": "src/live_relay/service.py",
-      "sha256": "c5094cc3c89e20e1dc367a6e9c2689e4a14943ca1522c6c104a8f803e9f1b953"
+      "sha256": "81b2271ff503e0e01291b2f466742a2fe9da4309b7fb899bf4ab8aad6f538399"
     },
     {
       "path": "src/live_relay/source.py",
@@ -135,7 +135,7 @@
     },
     {
       "path": "src/live_relay/updater.py",
-      "sha256": "e9232481779c405cc7bb518aab98400df2c56237c893d99478f0ec0b67916b1c"
+      "sha256": "2d96706d1b8ad762686ed7b0f2afd618e949f7ffe85bfcb1334e0de929f81fe5"
     },
     {
       "path": "start_live_relay.bat",
@@ -172,6 +172,10 @@
     {
       "path": "tests/test_regression_4_8_11.py",
       "sha256": "4ccb1cf4e61a7503040bfc40aee7a0d841cd47450506a9681f7de9eda31a0993"
+    },
+    {
+      "path": "tests/test_regression_4_8_12.py",
+      "sha256": "2039fb4e76868c0a52ca4dcd21566ee1084596030a8f0c6791ac8e72f193e476"
     },
     {
       "path": "tests/test_regression_4_8_3.py",
@@ -215,7 +219,7 @@
     },
     {
       "path": "tests/test_updater.py",
-      "sha256": "25db3b628fd46858da7f5b23a728f01fbb5d02b050388359e251bb8a94b29ed6"
+      "sha256": "ff2fa555bca34714411ee91334a8579fe8cf07193e52fbb403d4d8c8b5657a07"
     }
   ]
 }

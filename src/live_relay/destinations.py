@@ -82,19 +82,26 @@ class YouTubeQuotaTracker:
     def _today() -> str:
         return datetime.now(timezone.utc).date().isoformat()
 
-    def _load(self) -> None:
+    def _read_disk_used(self) -> int | None:
+        """The count another tracker instance saved, or None when the
+        file is missing, corrupt, wrongly shaped, or from another day."""
         if self._state_path is None:
-            return
+            return None
         try:
             data = json.loads(self._state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return
+            return None
         if not isinstance(data, dict) or data.get("day") != self._day:
-            return
+            return None
         used = data.get("used")
         if isinstance(used, bool) or not isinstance(used, int):
-            return
-        self.used = max(0, used)
+            return None
+        return max(0, used)
+
+    def _load(self) -> None:
+        used = self._read_disk_used()
+        if used is not None:
+            self.used = used
 
     def _save(self) -> None:
         """Write the current day and count atomically; caller holds the lock."""
@@ -140,6 +147,13 @@ class YouTubeQuotaTracker:
     def record(self, units: int) -> None:
         with self._lock:
             self._rollover()
+            # Merge first: the dashboard's short-lived verify tracker
+            # and the running relay each hold their own in-memory
+            # count, and a plain overwrite would silently drop the
+            # units the other instance recorded since this one loaded.
+            saved = self._read_disk_used()
+            if saved is not None:
+                self.used = max(self.used, saved)
             self.used += max(0, int(units))
             self._save()
 

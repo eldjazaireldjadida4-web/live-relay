@@ -63,9 +63,16 @@ class Progress:
         with self.lock:
             return dict(self.values)
 
-    def stalled(self, timeout: float) -> bool:
+    @property
+    def seen_output(self) -> bool:
+        """True once ffmpeg has reported output time at least once."""
         with self.lock:
-            return time.monotonic() - self.last_output_change > timeout
+            return self.last_output_ms >= 0
+
+    def stalled(self, timeout: float, now: float | None = None) -> bool:
+        with self.lock:
+            moment = time.monotonic() if now is None else now
+            return moment - self.last_output_change > timeout
 
 
 def _pump_progress(stream, state: Progress, stopped: threading.Event) -> None:
@@ -268,6 +275,12 @@ def _transport_failure_reason(platform: str) -> str:
 
 WORKER_BACKOFF_CAP = 30.0
 WORKER_STABLE_SECONDS = 120.0
+# Startup grace for the stall watchdog: a worker that has produced no
+# output yet is still starting up (ffmpeg connects, the source warms
+# up), so it gets the stall timeout plus this grace before it can be
+# declared stalled; once output has flowed, the plain timeout from
+# the last output change applies.
+WORKER_STARTUP_GRACE_SECONDS = 60.0
 # Session-level circuit breaker (H7): consecutive failures are counted on
 # the destination, not the worker, so they survive supervision re-entries.
 # After this many consecutive failures a destination cools down instead of
@@ -456,6 +469,86 @@ class WorkerState:
 
 def _worker_backoff(failures: int) -> float:
     return min(WORKER_BACKOFF_CAP, 2.0 * (2 ** max(0, failures - 1)))
+
+
+def _worker_is_stalled(
+    worker: WorkerState, stall_timeout: float, now: float
+) -> bool:
+    """True when a running worker has made no output progress for too long.
+
+    A worker that has produced no output yet is still starting up
+    (ffmpeg connects, the source warms up), so it gets the stall
+    timeout plus a startup grace before it can be declared stalled;
+    once output has flowed, the plain timeout from the last output
+    change applies.
+    """
+    timeout = stall_timeout
+    if not worker.progress.seen_output:
+        timeout += WORKER_STARTUP_GRACE_SECONDS
+    return worker.progress.stalled(timeout, now)
+
+
+class _SourceRefresher:
+    """Resolves the live source off the supervision thread.
+
+    ``resolve_source`` runs a yt-dlp lookup that can block for up to
+    90 seconds; running it inside the supervision loop froze stall
+    checks, heartbeats, status probes and stop handling for that long.
+    The lookup runs on a daemon thread instead, and the loop keeps
+    ticking until the fresh source is ready. A stop issued while a
+    lookup is in flight returns promptly: the thread is a daemon and
+    is never joined.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._result: LiveSource | None = None
+        self._done = threading.Event()
+
+    def start(self) -> None:
+        """Begin a resolve unless one is already running or a fresh
+        source is waiting to be taken."""
+        with self._lock:
+            if self._done.is_set():
+                return
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._result = None
+            self._done.clear()
+            thread = threading.Thread(target=self._run, daemon=True)
+            self._thread = thread
+            thread.start()
+
+    def _run(self) -> None:
+        try:
+            fresh = resolve_source(self._settings)
+        except Exception as exc:
+            logging.warning(
+                "Source refresh failed: %s", redact_urls(str(exc))[:200]
+            )
+            fresh = None
+        with self._lock:
+            self._result = fresh
+            self._done.set()
+
+    def take(self) -> tuple[bool, LiveSource | None]:
+        """(True, fresh) once a resolve finished; (False, None) while
+        one is still running; (True, None) when nothing is in flight
+        and no fresh source is waiting (a failed resolve, or none
+        started yet). The result is consumed: a later ``start`` can
+        launch a fresh resolve for the next restart."""
+        with self._lock:
+            if self._done.is_set():
+                fresh = self._result
+                self._result = None
+                self._done.clear()
+                self._thread = None
+                return True, fresh
+            if self._thread is not None and self._thread.is_alive():
+                return False, None
+            return True, None
 
 
 def _youtube_status_due(
@@ -707,17 +800,10 @@ def _start_encoder(
         )
 
     no_data_streak = 0
-
-    def refresh_source() -> LiveSource:
-        nonlocal source
-        try:
-            fresh = resolve_source(settings)
-        except Exception as exc:
-            logging.warning("Source refresh failed: %s", redact_urls(str(exc))[:200])
-            return source
-        if fresh is not None:
-            source = fresh
-        return source
+    # Source lookups run off the supervision thread (see
+    # _SourceRefresher): a blocking yt-dlp lookup must never freeze
+    # the loop that watches stalls, heartbeats and stops.
+    refresher = _SourceRefresher(settings)
 
     try:
         while not stopped.is_set():
@@ -790,7 +876,18 @@ def _start_encoder(
                     worker.next_start = now + _worker_backoff(worker.failures)
                 restartable = True
                 if now >= worker.next_start:
-                    current = refresh_source() if worker.failures else source
+                    if worker.failures:
+                        refresher.start()
+                        finished, fresh = refresher.take()
+                        if not finished:
+                            # The source lookup is still running in the
+                            # background; keep the supervision loop
+                            # ticking and retry the start shortly.
+                            worker.next_start = now + 1.0
+                            continue
+                        if fresh is not None:
+                            source = fresh
+                    current = source
                     if _start_worker(
                         worker,
                         ffmpeg,
@@ -833,7 +930,7 @@ def _start_encoder(
                             worker.failures
                         )
                     continue
-                if worker.progress.stalled(settings.stall_timeout):
+                if _worker_is_stalled(worker, settings.stall_timeout, now):
                     _teardown_worker(worker)
                     _note_worker_failure(
                         session,

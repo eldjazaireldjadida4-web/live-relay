@@ -1102,15 +1102,10 @@ class DashboardController:
         if self._is_running():
             raise RuntimeError("Stop the relay before authorizing YouTube")
         load_dotenv(self.env_path, override=True)
-        original_platforms = os.environ.get("LIVE_PLATFORMS")
-        os.environ["LIVE_PLATFORMS"] = "youtube"
-        try:
-            settings = load_settings()
-        finally:
-            if original_platforms is None:
-                os.environ.pop("LIVE_PLATFORMS", None)
-            else:
-                os.environ["LIVE_PLATFORMS"] = original_platforms
+        # No os.environ mutation: the override keeps the platform set
+        # local to this call, so a concurrent Start can never pick up
+        # the wrong platform set mid-exchange.
+        settings = load_settings(platforms_override=("youtube",))
         if not settings.youtube_api_enabled:
             raise RuntimeError("Select YouTube API mode before authorizing an account.")
         if not settings.youtube_client_secrets:
@@ -1123,15 +1118,7 @@ class DashboardController:
         if self._is_running():
             raise RuntimeError("Stop the relay before authorizing YouTube")
         load_dotenv(self.env_path, override=True)
-        original_platforms = os.environ.get("LIVE_PLATFORMS")
-        os.environ["LIVE_PLATFORMS"] = "youtube"
-        try:
-            settings = load_settings()
-        finally:
-            if original_platforms is None:
-                os.environ.pop("LIVE_PLATFORMS", None)
-            else:
-                os.environ["LIVE_PLATFORMS"] = original_platforms
+        settings = load_settings(platforms_override=("youtube",))
         if not settings.youtube_api_enabled:
             raise RuntimeError("Select YouTube API mode before authorizing an account.")
         if not settings.youtube_client_secrets:
@@ -1145,15 +1132,7 @@ class DashboardController:
         if self._is_running():
             raise RuntimeError("Stop the relay before authorizing YouTube")
         load_dotenv(self.env_path, override=True)
-        original_platforms = os.environ.get("LIVE_PLATFORMS")
-        os.environ["LIVE_PLATFORMS"] = "youtube"
-        try:
-            settings = load_settings()
-        finally:
-            if original_platforms is None:
-                os.environ.pop("LIVE_PLATFORMS", None)
-            else:
-                os.environ["LIVE_PLATFORMS"] = original_platforms
+        settings = load_settings(platforms_override=("youtube",))
         if not settings.youtube_api_enabled:
             raise RuntimeError("Select YouTube API mode before authorizing an account.")
         if not settings.youtube_client_secrets:

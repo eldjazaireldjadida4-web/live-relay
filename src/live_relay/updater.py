@@ -542,6 +542,9 @@ def apply_pending_update(project_root: Path, state_dir: Path) -> str | None:
     Returns ``None`` when nothing is staged. Preserved files (``.env``,
     ``.venv``, secrets, logs, the state directory) are never overwritten.
     The staged marker and zip are removed only after a successful apply.
+    Raises :class:`RuntimeError` when the state-dir guard skips every
+    target (the state directory covers the project tree): nothing is
+    recorded and the staged update stays in place for a retry.
     The staged zip is re-verified (size and sha256 when they were recorded,
     otherwise zip integrity) and the extracted tree must prove it is
     live-relay at the staged version before any file is touched.
@@ -634,6 +637,20 @@ def apply_pending_update(project_root: Path, state_dir: Path) -> str | None:
                         os.chmod(target, current | (recorded & 0o111))
                     except OSError:
                         pass
+            if not copied:
+                # The state-dir guard skipped every target (the state
+                # directory covers the project tree): recording this as
+                # a successful apply would delete the staged zip, clear
+                # the marker and claim the new version while nothing
+                # changed on disk — and the stale-file sweep below
+                # would then delete everything the updater installed
+                # before. Refuse loudly instead; the staged marker
+                # and zip stay in place so the update can be retried
+                # once the state directory is fixed.
+                raise RuntimeError(
+                    "Update applied no files: the state directory "
+                    "covers the project tree, so every target was skipped"
+                )
             # Files the updater installed before but this release no
             # longer ships would otherwise stay on disk (and stay
             # importable) forever. Remove only files the updater

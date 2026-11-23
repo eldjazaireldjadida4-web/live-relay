@@ -34,7 +34,8 @@ YOUTUBE_HTTP_TIMEOUT_SECONDS = 30
 # The default daily quota is 10,000 units, so probing every 30 s would
 # burn more than half of it in a day. The tracker below stretches the
 # probe interval as the budget runs out, and stops polling entirely
-# once it is spent; usage resets at midnight UTC.
+# once it is spent; usage resets at midnight UTC, and the count is
+# persisted in the state dir so a restart does not reset it.
 # Published YouTube Data API quota costs (units per call): list/read
 # calls cost 1, inserts, binds, transitions, updates and thumbnail
 # sets cost 50. Every call is recorded, not just the probes: a session
@@ -46,6 +47,14 @@ YOUTUBE_DAILY_QUOTA_UNITS = 10_000
 YOUTUBE_QUOTA_SLOW_AT = 0.70
 YOUTUBE_QUOTA_SLOWER_AT = 0.85
 YOUTUBE_QUOTA_CRITICAL_AT = 0.95
+# The counter is persisted in the state dir (next to
+# youtube-stream.json) so a restart mid-day no longer resets it to
+# zero: without this, a restarted relay would report a full budget
+# while the real daily quota was already partly spent, and could push
+# YouTube over its 10,000-unit day. A missing or corrupt file simply
+# starts at zero; a failed write is logged and the in-memory count
+# still stands, so persistence can never brick startup or a stream.
+YOUTUBE_QUOTA_STATE_FILENAME = "youtube-quota.json"
 
 
 class YouTubeQuotaTracker:
@@ -57,26 +66,82 @@ class YouTubeQuotaTracker:
     concurrent recording.
     """
 
-    def __init__(self, budget: int = YOUTUBE_DAILY_QUOTA_UNITS) -> None:
+    def __init__(
+        self,
+        budget: int = YOUTUBE_DAILY_QUOTA_UNITS,
+        state_path: Path | None = None,
+    ) -> None:
         self.budget = max(1, int(budget))
         self.used = 0
         self._day = self._today()
         self._lock = threading.RLock()
+        self._state_path = Path(state_path) if state_path is not None else None
+        self._load()
 
     @staticmethod
     def _today() -> str:
         return datetime.now(timezone.utc).date().isoformat()
+
+    def _load(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict) or data.get("day") != self._day:
+            return
+        used = data.get("used")
+        if isinstance(used, bool) or not isinstance(used, int):
+            return
+        self.used = max(0, used)
+
+    def _save(self) -> None:
+        """Write the current day and count atomically; caller holds the lock."""
+        if self._state_path is None:
+            return
+        parent = self._state_path.parent
+        try:
+            ensure_private_dir(parent)
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=".youtube-quota.", suffix=".tmp", dir=parent
+            )
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps({"day": self._day, "used": self.used})
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.chmod(temporary_path, 0o600)
+                except OSError:
+                    pass
+                os.replace(temporary_path, self._state_path)
+            finally:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+            try:
+                os.chmod(self._state_path, 0o600)
+            except OSError:
+                pass
+        except Exception as exc:
+            logging.warning("Could not persist YouTube quota usage: %s", exc)
 
     def _rollover(self) -> None:
         today = self._today()
         if today != self._day:
             self._day = today
             self.used = 0
+            self._save()
 
     def record(self, units: int) -> None:
         with self._lock:
             self._rollover()
             self.used += max(0, int(units))
+            self._save()
 
     @property
     def used_fraction(self) -> float:
@@ -194,10 +259,17 @@ class YouTubeDestination:
         self.broadcast: dict[str, Any] | None = None
         self.stream: dict[str, Any] | None = None
         self.metadata: StreamMetadata | None = None
+        state_dir = getattr(settings, "state_dir", None)
+        quota_state_path = (
+            Path(state_dir) / YOUTUBE_QUOTA_STATE_FILENAME
+            if state_dir is not None
+            else None
+        )
         self.quota = YouTubeQuotaTracker(
             budget=getattr(
                 settings, "youtube_quota_budget", YOUTUBE_DAILY_QUOTA_UNITS
-            )
+            ),
+            state_path=quota_state_path,
         )
 
     def _load_credentials(self, allow_browser: bool) -> tuple[Path, Any]:

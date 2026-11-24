@@ -1,5 +1,5 @@
 {
-  "version": "4.8.12",
+  "version": "4.8.13",
   "files": [
     {
       "path": ".env.example",
@@ -23,7 +23,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "668dc5a28ac864af17bdb3b71677139551bbd19cf55b9cbfb8582065cc302213"
+      "sha256": "9cd96386c6d6d6ff52e1936a2b0e0b596e0a6e045d65cb4667e0cfae40969c79"
     },
     {
       "path": "assets/live-relay-logo.png",
@@ -47,7 +47,7 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "f8f05adea85ab05d5ef396461ba2d88cf15e15b4e140d91d68599c443c99f72b"
+      "sha256": "b48bb5150612d475f47d356d80adfc763c54f82b72bb18cf1ca5023ade116654"
     },
     {
       "path": "src/live_relay/.env.example",
@@ -55,7 +55,7 @@
     },
     {
       "path": "src/live_relay/__init__.py",
-      "sha256": "337545c428a22c9f3d2547936b0d5b46e2e064b2612826b0f01be414ee0112b9"
+      "sha256": "2af6336459ebbb0e78373748c186e713d05230198938c21ff2810767f340493a"
     },
     {
       "path": "src/live_relay/__main__.py",
@@ -75,7 +75,7 @@
     },
     {
       "path": "src/live_relay/destinations.py",
-      "sha256": "693cacd7ae994fe9e2baa5a4724f7d065d9891fce7ebed42e6898acfe0366946"
+      "sha256": "daddf225a122e752d0fd87de470c2fe83e545c3c19fcffb0571d9072b453b5d3"
     },
     {
       "path": "src/live_relay/encoder.py",
@@ -111,11 +111,11 @@
     },
     {
       "path": "src/live_relay/service.py",
-      "sha256": "81b2271ff503e0e01291b2f466742a2fe9da4309b7fb899bf4ab8aad6f538399"
+      "sha256": "af838c359d0cef2f18ae5371bb9f35b412cce21b3c7358de8c91103a2b8889c9"
     },
     {
       "path": "src/live_relay/source.py",
-      "sha256": "f0d409e3c955e1f6bb370288849d76795c1a81f995946aeac2c71159eedfaae8"
+      "sha256": "6bed2b89da1841cebd57ec7756f5985ad1bf2f078c5d4a2885707a8b09a8e736"
     },
     {
       "path": "src/live_relay/source_platforms.py",
@@ -178,6 +178,10 @@
       "sha256": "2039fb4e76868c0a52ca4dcd21566ee1084596030a8f0c6791ac8e72f193e476"
     },
     {
+      "path": "tests/test_regression_4_8_13.py",
+      "sha256": "0068ad2929ebd73181c1d4dc83b4a1549bc2ab7fe86ce84d569d1ef42a6d8fd8"
+    },
+    {
       "path": "tests/test_regression_4_8_3.py",
       "sha256": "12e498c459bedfdfc670ad484af5d98c4b7bbcfc871d5db130d61f46d690eb9a"
     },
@@ -219,7 +223,7 @@
     },
     {
       "path": "tests/test_updater.py",
-      "sha256": "ff2fa555bca34714411ee91334a8579fe8cf07193e52fbb403d4d8c8b5657a07"
+      "sha256": "e8bf62d8662fae70d0bcaeb3ebdfdc87353077f03f579616c07e356c43493f29"
     }
   ]
 }

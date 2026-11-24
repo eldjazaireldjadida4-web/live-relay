@@ -551,6 +551,42 @@ class _SourceRefresher:
             return True, None
 
 
+def _resolve_source_interruptible(
+    settings: Settings, stopped: threading.Event
+) -> tuple[LiveSource | None, bool]:
+    """Resolve the live source without blocking the stop event.
+
+    ``resolve_source`` runs a yt-dlp lookup that can block for up to 90
+    seconds; called synchronously from ``run()`` it ignored a stop
+    issued during the lookup, and the dashboard only joins the relay
+    thread for 30 s, so the stop was reported as timed out. The lookup
+    runs on a daemon thread here and the caller polls the stop event
+    while waiting. Returns ``(source, stopped)``: ``stopped`` is True
+    when the stop event was set while waiting (the lookup result is
+    then discarded). A lookup error is re-raised in the caller, exactly
+    as the old synchronous call did.
+    """
+    result: dict[str, Any] = {}
+    done = threading.Event()
+
+    def _lookup() -> None:
+        try:
+            result["source"] = resolve_source(settings)
+        except Exception as exc:  # re-raised by the caller
+            result["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_lookup, name="source-lookup", daemon=True)
+    thread.start()
+    while not done.wait(0.1):
+        if stopped.is_set():
+            return None, True
+    if "error" in result:
+        raise result["error"]
+    return result.get("source"), False
+
+
 def _youtube_status_due(
     youtube: Any, now: float, last_check: float, heartbeat: float
 ) -> bool:
@@ -627,6 +663,10 @@ def _start_worker(
     portrait = getattr(source, "width", 0) > 0 and getattr(
         source, "height", 0
     ) > getattr(source, "width", 0)
+    # A fresh start attempt has no failure yet; the supervisor reads
+    # this field when the start fails, so a stale reason from the
+    # previous cycle must not be reported as the new one.
+    worker.failure_reason = ""
     try:
         logo_path, frame_path = _branding_inputs(settings, portrait)
     except ValueError as exc:
@@ -670,13 +710,33 @@ def _start_worker(
             # A dead pipe is restarted here, so the restart is paced by
             # the existing worker backoff instead of a tight loop.
             if not shared_pipe.alive() and not shared_pipe.restart():
+                worker.failure_reason = (
+                    getattr(shared_pipe, "last_error", "")
+                    or "Could not start the shared yt-dlp pipe"
+                )
                 logging.error(
-                    "Could not start the shared yt-dlp pipe for %s",
+                    "Could not start the shared yt-dlp pipe for %s: %s",
                     worker.name,
+                    worker.failure_reason,
                 )
                 return False
             input_stream = subprocess.PIPE
         else:
+            # Per-worker pipe (no shared pipe): same cookie-file guard
+            # as SharedSourcePipe.start() — a yt-dlp spawned without
+            # its cookie file exits at once and the worker would loop
+            # on a generic "FFmpeg exited" reason instead.
+            cookie_path = getattr(settings, "cookie_file", "")
+            if cookie_path and not Path(cookie_path).is_file():
+                worker.failure_reason = (
+                    f"YTDLP_COOKIE_FILE is missing: {cookie_path}"
+                )
+                logging.error(
+                    "Could not start yt-dlp pipe for %s: %s",
+                    worker.name,
+                    worker.failure_reason,
+                )
+                return False
             try:
                 pipe_process = subprocess.Popen(
                     build_pipe_command(settings),
@@ -904,7 +964,8 @@ def _start_encoder(
                             worker,
                             notifier,
                             now,
-                            "FFmpeg or yt-dlp could not start; see the log for details",
+                            worker.failure_reason
+                            or "FFmpeg or yt-dlp could not start; see the log for details",
                         )
                         if not worker.exhausted:
                             worker.next_start = now + _worker_backoff(worker.failures)
@@ -1229,12 +1290,16 @@ def run(
 
     while not stopped.is_set():
         try:
-            source = resolve_source(settings)
+            source, resolve_stopped = _resolve_source_interruptible(
+                settings, stopped
+            )
         except Exception:
             if session:
                 _close_active_destinations(session, status)
                 session = None
             raise
+        if resolve_stopped:
+            break
         if source is None:
             if session is None:
                 if status:

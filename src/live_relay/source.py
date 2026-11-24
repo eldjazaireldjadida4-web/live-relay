@@ -223,6 +223,12 @@ class SharedSourcePipe:
 
     def __init__(self, settings: Settings) -> None:
         self._command = build_pipe_command(settings)
+        self._cookie_file = getattr(settings, "cookie_file", "") or ""
+        # The last start failure, for the supervisor to report: a pipe
+        # that cannot start because its cookie file vanished must say
+        # so, instead of the generic "FFmpeg exited" after yt-dlp dies
+        # on every restart.
+        self.last_error = ""
         self._process: subprocess.Popen[bytes] | None = None
         self._pump: threading.Thread | None = None
         self._subscribers: set[Any] = set()
@@ -235,6 +241,20 @@ class SharedSourcePipe:
     def start(self) -> bool:
         if self.alive():
             return True
+        self.last_error = ""
+        if self._cookie_file and not Path(self._cookie_file).is_file():
+            # Unlike resolve_source(), the pipe path never validated
+            # the cookie file: a file that vanished mid-run made every
+            # restart spawn a yt-dlp that exited at once, while
+            # restart() still returned True and the worker looped with
+            # a generic "FFmpeg exited" reason.
+            self.last_error = (
+                f"YTDLP_COOKIE_FILE is missing: {self._cookie_file}"
+            )
+            logging.error(
+                "Cannot start the shared yt-dlp pipe: %s", self.last_error
+            )
+            return False
         self._stopped.clear()
         try:
             process = subprocess.Popen(

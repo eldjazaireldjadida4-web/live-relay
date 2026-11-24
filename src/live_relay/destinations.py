@@ -56,6 +56,25 @@ YOUTUBE_QUOTA_CRITICAL_AT = 0.95
 # still stands, so persistence can never brick startup or a stream.
 YOUTUBE_QUOTA_STATE_FILENAME = "youtube-quota.json"
 
+# One lock per quota state file, shared by every tracker instance in
+# this process: the read-merge-save cycle in record() must be atomic
+# across instances, or two trackers recording at the same time both
+# read the same on-disk count and one unit is lost per collision. The
+# registry itself is guarded by its own lock; entries are never
+# removed (one state file per deployment in practice).
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _state_path_lock(state_path: Path) -> threading.Lock:
+    key = str(state_path.resolve())
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
 
 class YouTubeQuotaTracker:
     """Daily YouTube Data API quota usage for status polling.
@@ -145,17 +164,34 @@ class YouTubeQuotaTracker:
             self._save()
 
     def record(self, units: int) -> None:
-        with self._lock:
-            self._rollover()
-            # Merge first: the dashboard's short-lived verify tracker
-            # and the running relay each hold their own in-memory
-            # count, and a plain overwrite would silently drop the
-            # units the other instance recorded since this one loaded.
-            saved = self._read_disk_used()
-            if saved is not None:
-                self.used = max(self.used, saved)
-            self.used += max(0, int(units))
-            self._save()
+        # The merge below must be atomic across tracker instances in
+        # this process: the instance RLock alone lets two trackers read
+        # the same on-disk count and save over each other, losing one
+        # unit per collision. The path lock serialises the whole
+        # read-merge-save cycle; trackers without a state file (purely
+        # in-memory) have nothing shared to protect.
+        path_lock = (
+            _state_path_lock(self._state_path)
+            if self._state_path is not None
+            else None
+        )
+        if path_lock is not None:
+            path_lock.acquire()
+        try:
+            with self._lock:
+                self._rollover()
+                # Merge first: the dashboard's short-lived verify tracker
+                # and the running relay each hold their own in-memory
+                # count, and a plain overwrite would silently drop the
+                # units the other instance recorded since this one loaded.
+                saved = self._read_disk_used()
+                if saved is not None:
+                    self.used = max(self.used, saved)
+                self.used += max(0, int(units))
+                self._save()
+        finally:
+            if path_lock is not None:
+                path_lock.release()
 
     @property
     def used_fraction(self) -> float:
